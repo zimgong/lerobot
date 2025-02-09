@@ -519,6 +519,8 @@ class PI0FlowMatching(nn.Module):
             img,
             img_mask,
         ) in zip(images, img_masks, strict=False):
+            if img.shape[1] != 3:
+                continue
             img_emb = self.paligemma_with_expert.embed_image(img)
             img_emb = img_emb.to(dtype=torch.bfloat16)
 
