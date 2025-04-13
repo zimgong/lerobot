@@ -66,7 +66,7 @@ from lerobot.common.optim.factory import make_optimizer_and_scheduler
 from lerobot.common.policies.factory import make_policy
 # from lerobot.common.policies.factory import register_policy_class
 from lerobot.common.policies.pi0.modeling_pi0 import PI0Policy, PI0FlowMatching
-from lerobot.common.policies.pi0.onesteppi0_AC import PI0OneStepConfig, PI0OneStepModel, PI0OneStepPolicy
+from lerobot.common.policies.pi0.onesteppi0_AC import PI0OneStepACConfig, PI0OneStepModel, PI0OneStepACPolicy
 from lerobot.common.policies.pi0.configuration_pi0 import PI0Config
 from lerobot.common.constants import ACTION, OBS_ROBOT
 from lerobot.common.policies.pretrained import PreTrainedPolicy
@@ -265,7 +265,7 @@ def distill_pi0_deepspeed(cfg: DistillDeepSpeedPipelineConfig):
         policy.load_state_dict(teacher_policy.state_dict(), strict=False)
     
     # Set teacher policy
-    if isinstance(policy, PI0OneStepPolicy):
+    if isinstance(policy, PI0OneStepACPolicy):
         policy.teacher_policy = teacher_policy
     else:
         if is_main_process:
