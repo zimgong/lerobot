@@ -761,7 +761,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
             next_item = copy.deepcopy(item)
 
         for key in next_item:
-            if "state" in key:
+            if "state" in key or "obs" in key:
                 item["next_" + key] = next_item[key]
 
         # add reward for Reinforcement Learning
