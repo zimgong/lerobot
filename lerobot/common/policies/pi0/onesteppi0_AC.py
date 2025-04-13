@@ -173,6 +173,89 @@ class PI0OneStepModel(nn.Module):
         return actions
 
 
+class PI0OneStepModelCritic(nn.Module):
+    """One-step distilled version of Pi0 that directly predicts actions"""
+    
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        
+        # We use the same architecture as PI0FlowMatching
+        self.flow_model = PI0FlowMatching(config)
+        
+        # Add a final projection layer to map from flow outputs to direct actions
+        # This helps the model adapt from predicting noise residuals to predicting actions directly
+        self.lienar_prob = nn.Linear(config.max_action_dim, 1)
+        
+        
+    def forward(self, images, img_masks, lang_tokens, lang_masks, state,action):
+        """Direct prediction of actions without iterative denoising"""
+        bsize = state.shape[0]
+        device = state.device
+        
+        # We still need some noise input for the architecture to work consistently
+        # But we'll use a fixed time step (t=0) to represent "clean" actions
+        fixed_time = torch.ones(bsize, dtype=torch.float32, device=device)
+        
+        # Create a zero tensor with the shape of actions
+        # This represents our "prediction" at t=0, which we'll update
+        action_shape = (bsize, self.config.n_action_steps, self.config.max_action_dim)
+        x_0 = action
+        
+        # Process prefix (images and language)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.flow_model.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks
+        )
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+
+        # Get cached KV from prefix processing
+        _, past_key_values = self.flow_model.paligemma_with_expert.forward(
+            attention_mask=prefix_att_2d_masks,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=True,
+            fill_kv_cache=True,
+        )
+        
+        # Process state and current action prediction
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.flow_model.embed_suffix(
+            state, x_0, fixed_time
+        )
+
+        suffix_len = suffix_pad_masks.shape[1]
+        batch_size = prefix_pad_masks.shape[0]
+        prefix_len = prefix_pad_masks.shape[1]
+        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
+
+        suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
+
+        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+        position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+
+        # Get model outputs
+        outputs_embeds, _ = self.flow_model.paligemma_with_expert.forward(
+            attention_mask=full_att_2d_masks,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=[None, suffix_embs],
+            use_cache=True,
+            fill_kv_cache=False,
+        )
+        
+        suffix_out = outputs_embeds[1]
+        suffix_out = suffix_out[:, -self.config.n_action_steps:]
+        suffix_out = suffix_out.to(dtype=torch.float32)
+        
+        # Instead of using this as a flow/velocity prediction,
+        # we transform it into a direct action prediction
+        actions = self.flow_model.action_out_proj(suffix_out)
+        score = self.lienar_prob(actions)  # Additional adaptation layer
+        
+        return score
+
 class PI0OneStepPolicy(PI0Policy):
     """Wrapper around PI0OneStepModel to use the same interface as PI0Policy"""
     
@@ -204,6 +287,23 @@ class PI0OneStepPolicy(PI0Policy):
         
         # Reset action queue
         self.reset()
+        
+    def make_critic(self):
+        """Create the critic model"""
+        # Use the same architecture as PI0FlowMatching
+        self.critic = PI0OneStepModelCritic(self.config)
+        missing_keys, unexpected_keys = self.critic.load_state_dict(self.model.state_dict(), strict=False)
+        print("Missing keys:", missing_keys)
+        print("Unexpected keys:", unexpected_keys)
+        
+        # Initialize the target critic
+        self.target_critic = PI0OneStepModelCritic(self.config)
+        
+        # Copy weights from critic to target critic
+        self.target_critic.load_state_dict(self.critic.state_dict())
+        
+        # Set target critic to eval mode
+        self.target_critic.eval()
     
     @torch.no_grad()
     def select_action(self, batch, noise=None):
