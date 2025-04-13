@@ -20,7 +20,6 @@ from pathlib import Path
 from typing import Callable
 import copy
 
-
 import datasets
 import numpy as np
 import packaging.version
@@ -69,13 +68,11 @@ from lerobot.common.datasets.utils import (
 )
 from lerobot.common.datasets.video_utils import (
     VideoFrame,
-    decode_video_frames,
+    decode_video_frames_torchvision,
     encode_video_frames,
-    get_safe_default_codec,
     get_video_info,
 )
 from lerobot.common.robot_devices.robots.utils import Robot
-import copy
 
 CODEBASE_VERSION = "v2.1"
 
@@ -466,8 +463,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
             download_videos (bool, optional): Flag to download the videos. Note that when set to True but the
                 video files are already present on local disk, they won't be downloaded again. Defaults to
                 True.
-            video_backend (str | None, optional): Video backend to use for decoding videos. Defaults to torchcodec when available int the platform; otherwise, defaults to 'pyav'.
-                You can also use the 'pyav' decoder used by Torchvision, which used to be the default option, or 'video_reader' which is another decoder of Torchvision.
+            video_backend (str | None, optional): Video backend to use for decoding videos. There is currently
+                a single option which is the pyav decoder used by Torchvision. Defaults to pyav.
         """
         super().__init__()
         self.repo_id = repo_id
@@ -477,7 +474,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.episodes = episodes
         self.tolerance_s = tolerance_s
         self.revision = revision if revision else CODEBASE_VERSION
-        self.video_backend = video_backend if video_backend else get_safe_default_codec()
+        self.video_backend = video_backend if video_backend else "pyav"
         self.delta_indices = None
 
         # Unused attributes
@@ -711,7 +708,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
         item = {}
         for vid_key, query_ts in query_timestamps.items():
             video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
-            frames = decode_video_frames(video_path, query_ts, self.tolerance_s, self.video_backend)
+            frames = decode_video_frames_torchvision(
+                video_path, query_ts, self.tolerance_s, self.video_backend
+            )
             item[vid_key] = frames.squeeze(0)
 
         return item
@@ -776,13 +775,10 @@ class LeRobotDataset(torch.utils.data.Dataset):
         delta_action_acceleration = delta_action[1:, :] - delta_action[:-1, :]
         item["rwd_action_acceleration_l2"] = torch.sum(torch.square(delta_action_acceleration), dim=-1).mean() / action.shape[1]
 
-        
-        
-        
-
         return item
+    
 
-    def get_item_helper(self, idx: int) -> dict:
+    def get_item_helper(self, idx) -> dict:
 
         """
         Original __getitem__ function.
@@ -1094,7 +1090,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         obj.delta_timestamps = None
         obj.delta_indices = None
         obj.episode_data_index = None
-        obj.video_backend = video_backend if video_backend is not None else get_safe_default_codec()
+        obj.video_backend = video_backend if video_backend is not None else "pyav"
         return obj
 
 
@@ -1246,91 +1242,25 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
     def __len__(self):
         return self.num_frames
 
-    def __getitem__(self, idx) -> dict:
-        item = self.hf_dataset[idx]
-        ep_idx = item["episode_index"].item()
-
-        query_indices = None
-        if self.delta_indices is not None:
-            query_indices, padding = self._get_query_indices(idx, ep_idx)
-            query_result = self._query_hf_dataset(query_indices)
-            item = {**item, **padding}
-            for key, val in query_result.items():
-                item[key] = val
-
-        if len(self.meta.video_keys) > 0:
-            current_ts = item["timestamp"].item()
-            query_timestamps = self._get_query_timestamps(current_ts, query_indices)
-            video_frames = self._query_videos(query_timestamps, ep_idx)
-            item = {**video_frames, **item}
-
-        if self.image_transforms is not None:
-            image_keys = self.meta.camera_keys
-            for cam in image_keys:
-                item[cam] = self.image_transforms(item[cam])
-
-        # Add task as a string
-        task_idx = item["task_index"].item()
-        item["task"] = self.meta.tasks[task_idx]
-
-        # add next state for Reinforcement Learning
-        if idx < self.num_frames - 1:
-            next_item = self.get_item_helper(idx + 1)
-            if next_item["task_index"].item() != task_idx:
-                next_item = copy.deepcopy(item)
-            
-            assert next_item
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        if idx >= len(self):
+            raise IndexError(f"Index {idx} out of bounds.")
+        # Determine which dataset to get an item from based on the index.
+        start_idx = 0
+        dataset_idx = 0
+        for dataset in self._datasets:
+            if idx >= start_idx + dataset.num_frames:
+                start_idx += dataset.num_frames
+                dataset_idx += 1
+                continue
+            break
         else:
-            next_item = copy.deepcopy(item)
-
-        for key in next_item:
-            if "state" in key:
-                item["next_" + key] = next_item[key]
-
-        # add reward for Reinforcement Learning
-        action = item["action"]
-
-        # action rate l2
-        delta_action = action[1:, :] - action[:-1, :]
-        item["rwd_action_rate_l2"] = torch.sum(torch.square(delta_action), dim=-1).mean() / action.shape[1]
-
-        # action acceleration l2
-        delta_action_acceleration = delta_action[1:, :] - delta_action[:-1, :]
-        item["rwd_action_acceleration_l2"] = torch.sum(torch.square(delta_action_acceleration), dim=-1).mean() / action.shape[1]
-
-        return item
-
-    def get_item_helper(self, idx: int) -> dict:
-
-        """
-        Original __getitem__ function.
-        """
-
-        item = self.hf_dataset[idx]
-        ep_idx = item["episode_index"].item()
-
-        query_indices = None
-        if self.delta_indices is not None:
-            query_indices, padding = self._get_query_indices(idx, ep_idx)
-            query_result = self._query_hf_dataset(query_indices)
-            item = {**item, **padding}
-            for key, val in query_result.items():
-                item[key] = val
-
-        if len(self.meta.video_keys) > 0:
-            current_ts = item["timestamp"].item()
-            query_timestamps = self._get_query_timestamps(current_ts, query_indices)
-            video_frames = self._query_videos(query_timestamps, ep_idx)
-            item = {**video_frames, **item}
-
-        if self.image_transforms is not None:
-            image_keys = self.meta.camera_keys
-            for cam in image_keys:
-                item[cam] = self.image_transforms(item[cam])
-
-        # Add task as a string
-        task_idx = item["task_index"].item()
-        item["task"] = self.meta.tasks[task_idx]
+            raise AssertionError("We expect the loop to break out as long as the index is within bounds.")
+        item = self._datasets[dataset_idx][idx - start_idx]
+        item["dataset_index"] = torch.tensor(dataset_idx)
+        for data_key in self.disabled_features:
+            if data_key in item:
+                del item[data_key]
 
         return item
 
