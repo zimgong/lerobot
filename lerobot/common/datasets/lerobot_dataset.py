@@ -18,6 +18,8 @@ import logging
 import shutil
 from pathlib import Path
 from typing import Callable
+import copy
+
 
 import datasets
 import numpy as np
@@ -73,6 +75,7 @@ from lerobot.common.datasets.video_utils import (
     get_video_info,
 )
 from lerobot.common.robot_devices.robots.utils import Robot
+import copy
 
 CODEBASE_VERSION = "v2.1"
 
@@ -748,6 +751,69 @@ class LeRobotDataset(torch.utils.data.Dataset):
         task_idx = item["task_index"].item()
         item["task"] = self.meta.tasks[task_idx]
 
+        # add next state for Reinforcement Learning
+        if idx < self.num_frames - 1:
+            next_item = self.get_item_helper(idx + 1)
+            if next_item["task_index"].item() != task_idx:
+                next_item = copy.deepcopy(item)
+            
+            assert next_item
+        else:
+            next_item = copy.deepcopy(item)
+
+        for key in next_item:
+            if "state" in key:
+                item["next_" + key] = next_item[key]
+
+        # add reward for Reinforcement Learning
+        action = item["action"]
+
+        # action rate l2
+        delta_action = action[1:, :] - action[:-1, :]
+        item["rwd_action_rate_l2"] = torch.sum(torch.square(delta_action), dim=-1).mean() / action.shape[1]
+
+        # action acceleration l2
+        delta_action_acceleration = delta_action[1:, :] - delta_action[:-1, :]
+        item["rwd_action_acceleration_l2"] = torch.sum(torch.square(delta_action_acceleration), dim=-1).mean() / action.shape[1]
+
+        
+        
+        
+
+        return item
+
+    def get_item_helper(self, idx: int) -> dict:
+
+        """
+        Original __getitem__ function.
+        """
+
+        item = self.hf_dataset[idx]
+        ep_idx = item["episode_index"].item()
+
+        query_indices = None
+        if self.delta_indices is not None:
+            query_indices, padding = self._get_query_indices(idx, ep_idx)
+            query_result = self._query_hf_dataset(query_indices)
+            item = {**item, **padding}
+            for key, val in query_result.items():
+                item[key] = val
+
+        if len(self.meta.video_keys) > 0:
+            current_ts = item["timestamp"].item()
+            query_timestamps = self._get_query_timestamps(current_ts, query_indices)
+            video_frames = self._query_videos(query_timestamps, ep_idx)
+            item = {**video_frames, **item}
+
+        if self.image_transforms is not None:
+            image_keys = self.meta.camera_keys
+            for cam in image_keys:
+                item[cam] = self.image_transforms(item[cam])
+
+        # Add task as a string
+        task_idx = item["task_index"].item()
+        item["task"] = self.meta.tasks[task_idx]
+
         return item
 
     def __repr__(self):
@@ -1180,25 +1246,91 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
     def __len__(self):
         return self.num_frames
 
-    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        if idx >= len(self):
-            raise IndexError(f"Index {idx} out of bounds.")
-        # Determine which dataset to get an item from based on the index.
-        start_idx = 0
-        dataset_idx = 0
-        for dataset in self._datasets:
-            if idx >= start_idx + dataset.num_frames:
-                start_idx += dataset.num_frames
-                dataset_idx += 1
-                continue
-            break
+    def __getitem__(self, idx) -> dict:
+        item = self.hf_dataset[idx]
+        ep_idx = item["episode_index"].item()
+
+        query_indices = None
+        if self.delta_indices is not None:
+            query_indices, padding = self._get_query_indices(idx, ep_idx)
+            query_result = self._query_hf_dataset(query_indices)
+            item = {**item, **padding}
+            for key, val in query_result.items():
+                item[key] = val
+
+        if len(self.meta.video_keys) > 0:
+            current_ts = item["timestamp"].item()
+            query_timestamps = self._get_query_timestamps(current_ts, query_indices)
+            video_frames = self._query_videos(query_timestamps, ep_idx)
+            item = {**video_frames, **item}
+
+        if self.image_transforms is not None:
+            image_keys = self.meta.camera_keys
+            for cam in image_keys:
+                item[cam] = self.image_transforms(item[cam])
+
+        # Add task as a string
+        task_idx = item["task_index"].item()
+        item["task"] = self.meta.tasks[task_idx]
+
+        # add next state for Reinforcement Learning
+        if idx < self.num_frames - 1:
+            next_item = self.get_item_helper(idx + 1)
+            if next_item["task_index"].item() != task_idx:
+                next_item = copy.deepcopy(item)
+            
+            assert next_item
         else:
-            raise AssertionError("We expect the loop to break out as long as the index is within bounds.")
-        item = self._datasets[dataset_idx][idx - start_idx]
-        item["dataset_index"] = torch.tensor(dataset_idx)
-        for data_key in self.disabled_features:
-            if data_key in item:
-                del item[data_key]
+            next_item = copy.deepcopy(item)
+
+        for key in next_item:
+            if "state" in key:
+                item["next_" + key] = next_item[key]
+
+        # add reward for Reinforcement Learning
+        action = item["action"]
+
+        # action rate l2
+        delta_action = action[1:, :] - action[:-1, :]
+        item["rwd_action_rate_l2"] = torch.sum(torch.square(delta_action), dim=-1).mean() / action.shape[1]
+
+        # action acceleration l2
+        delta_action_acceleration = delta_action[1:, :] - delta_action[:-1, :]
+        item["rwd_action_acceleration_l2"] = torch.sum(torch.square(delta_action_acceleration), dim=-1).mean() / action.shape[1]
+
+        return item
+
+    def get_item_helper(self, idx: int) -> dict:
+
+        """
+        Original __getitem__ function.
+        """
+
+        item = self.hf_dataset[idx]
+        ep_idx = item["episode_index"].item()
+
+        query_indices = None
+        if self.delta_indices is not None:
+            query_indices, padding = self._get_query_indices(idx, ep_idx)
+            query_result = self._query_hf_dataset(query_indices)
+            item = {**item, **padding}
+            for key, val in query_result.items():
+                item[key] = val
+
+        if len(self.meta.video_keys) > 0:
+            current_ts = item["timestamp"].item()
+            query_timestamps = self._get_query_timestamps(current_ts, query_indices)
+            video_frames = self._query_videos(query_timestamps, ep_idx)
+            item = {**video_frames, **item}
+
+        if self.image_transforms is not None:
+            image_keys = self.meta.camera_keys
+            for cam in image_keys:
+                item[cam] = self.image_transforms(item[cam])
+
+        # Add task as a string
+        task_idx = item["task_index"].item()
+        item["task"] = self.meta.tasks[task_idx]
 
         return item
 
