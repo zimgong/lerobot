@@ -50,11 +50,11 @@ from torch.optim import Optimizer
 from termcolor import colored
 
 
-@PreTrainedConfig.register_subclass("pi0_onestep")
+@PreTrainedConfig.register_subclass("pi0_onestep_ac")
 @dataclass
-class PI0OneStepConfig(PI0Config):
+class PI0OneStepACConfig(PI0Config):
     """Configuration for Pi0 one-step model."""
-    type: str = "pi0_onestep"
+    type: str = "pi0_onestep_ac"
 
 
 
@@ -256,11 +256,11 @@ class PI0OneStepModelCritic(nn.Module):
         
         return score
 
-class PI0OneStepPolicy(PI0Policy):
+class PI0OneStepACPolicy(PI0Policy):
     """Wrapper around PI0OneStepModel to use the same interface as PI0Policy"""
     
-    config_class = PI0OneStepConfig
-    name = "pi0_onestep"
+    config_class = PI0OneStepACConfig
+    name = "pi0_onestep_ac"
     
     def __init__(self, config, dataset_stats=None, teacher_policy=None):
         # Initialize the parent class but we'll override the model
@@ -268,12 +268,18 @@ class PI0OneStepPolicy(PI0Policy):
         config.validate_features()
         self.config = config
         
+        for input_feature in config.input_features:
+            config["next_" + input_feature] = config[input_feature]
+        
+        
         # Setup normalization components
         if hasattr(config, 'normalization_mapping') and hasattr(config, 'input_features') and hasattr(config, 'output_features'):
             from lerobot.common.policies.normalize import Normalize, Unnormalize
             self.normalize_inputs = Normalize(config.input_features, config.normalization_mapping, dataset_stats)
             self.normalize_targets = Normalize(config.output_features, config.normalization_mapping, dataset_stats)
             self.unnormalize_outputs = Unnormalize(config.output_features, config.normalization_mapping, dataset_stats)
+            
+            
         
         # Setup tokenizer
         from transformers import AutoTokenizer
@@ -338,6 +344,48 @@ class PI0OneStepPolicy(PI0Policy):
             
         return self._action_queue.popleft()
     
+    def prepare_next_images(self, batch):
+        """Apply Pi0 preprocessing to the images, like resizing to 224x224 and padding to keep aspect ratio, and
+        convert pixel range from [0.0, 1.0] to [-1.0, 1.0] as requested by SigLIP.
+        """
+        images = []
+        img_masks = []
+
+        present_img_keys = [key for key in self.config.image_features if key in batch]
+        missing_img_keys = [key for key in self.config.image_features if key not in batch]
+
+        if len(present_img_keys) == 0:
+            raise ValueError(
+                f"All image features are missing from the batch. At least one expected. (batch: {batch.keys()}) (image_features:{self.config.image_features})"
+            )
+
+        # Preprocess image features present in the batch
+        for key in present_img_keys:
+            img = batch[key]
+
+            if self.config.resize_imgs_with_padding is not None:
+                img = resize_with_pad(img, *self.config.resize_imgs_with_padding, pad_value=0)
+
+            # Normalize from range [0,1] to [-1,1] as expacted by siglip
+            img = img * 2.0 - 1.0
+
+            bsize = img.shape[0]
+            device = img.device
+            mask = torch.ones(bsize, dtype=torch.bool, device=device)
+            images.append(img)
+            img_masks.append(mask)
+
+        # Create image features not present in the batch
+        # as fully 0 padded images.
+        for num_empty_cameras in range(len(missing_img_keys)):
+            if num_empty_cameras >= self.config.empty_cameras:
+                break
+            img = torch.ones_like(img) * -1
+            mask = torch.zeros_like(mask)
+            images.append(img)
+            img_masks.append(mask)
+
+        return images, img_masks
     def forward(self, batch, temperature=1.0, soft_weight=0.5, hard_weight=0.5):
         """Forward pass for training with distillation"""
         # Handle Pi-Aloha adaptation if needed
@@ -345,6 +393,13 @@ class PI0OneStepPolicy(PI0Policy):
             batch[OBS_ROBOT] = self._pi_aloha_decode_state(batch[OBS_ROBOT])
             batch[ACTION] = self._pi_aloha_encode_actions_inv(batch[ACTION])
             
+        print(batch.keys())
+        print( self.config.image_features)
+        # print(batch["next_observation.state"].keys())
+        # for key in batch:
+        #     if key.startswith("observation.images."):
+        #         batch["next_" + key] = batch[key]
+        
         
         # Normalize inputs and targets
         batch = self.normalize_inputs(batch)
