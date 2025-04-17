@@ -1,5 +1,5 @@
 rm -r checkpoints/pi0_onestep_rl
-deepspeed --num_gpus=6  lerobot/scripts/off_policy_pi0.py\
+CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 deepspeed  lerobot/scripts/off_policy_pi0.py\
   --teacher /data/ceph_hdd/main/dev/zim.gong/yidong/lerobot/checkpoints/pi0_new  \
   --policy.type pi0_onestep_ac \
   --output_dir checkpoints/pi0_onestep_rl \

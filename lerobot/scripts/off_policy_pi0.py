@@ -251,6 +251,7 @@ def distill_pi0_deepspeed(cfg: DistillDeepSpeedPipelineConfig):
     # Create student model
     if is_main_process:
         logging.info("Creating student policy")
+    # print(cfg.policy)
     policy = make_policy(
         cfg=cfg.policy,
         ds_meta=dataset.meta,
@@ -274,21 +275,37 @@ def distill_pi0_deepspeed(cfg: DistillDeepSpeedPipelineConfig):
     # Create or load DeepSpeed config
     ds_config = create_ds_config(cfg) if cfg.deepspeed else None
     
-    # Prepare parameters for optimizer
-    optimizer_params = [{"params": [p for p in policy.parameters() if p.requires_grad]}]
+    # Define actor and critic parameter groups for optimization
+    actor_params = []
+    critic_params = []
+    
+    # Collect actor parameters (the main policy model)
+    for name, param in policy.named_parameters():
+        if 'critic' not in name and param.requires_grad:
+            actor_params.append(param)
+    
+    # Collect critic parameters
+    for name, param in policy.named_parameters():
+        if 'critic' in name and 'target_critic' not in name and param.requires_grad:
+            critic_params.append(param)
+    
+    # Create optimizer parameter groups
+    optimizer_params = [
+        {"params": actor_params, "name": "actor"},
+        {"params": critic_params, "name": "critic"}
+    ]
     
     # Initialize DeepSpeed
     if is_main_process:
-        logging.info("Initializing DeepSpeed engine")
+        logging.info(f"Actor parameters: {len(actor_params)}")
+        logging.info(f"Critic parameters: {len(critic_params)}")
     if is_main_process:
         print(ds_config)
     # Initialize DeepSpeed model engine
     model_engine, optimizer, _, lr_scheduler = deepspeed.initialize(
         model=policy,
         model_parameters=optimizer_params,
-        config=ds_config if cfg.deepspeed else None,
-        optimizer=None,
-        lr_scheduler=None
+        config=ds_config if cfg.deepspeed else None
     )
     
     step = 0  # Number of policy updates
@@ -393,10 +410,12 @@ def distill_pi0_deepspeed(cfg: DistillDeepSpeedPipelineConfig):
     # Define metrics to track (only on main process)
     if is_main_process:
         train_metrics = {
-            "loss": AverageMeter("loss", ":.3f"),
+            "actor_loss": AverageMeter("actor", ":.3f"),
+            "critic_loss": AverageMeter("critic", ":.3f"),
             "soft_loss": AverageMeter("soft", ":.3f"),
             "hard_loss": AverageMeter("hard", ":.3f"),
-            "teacher_loss": AverageMeter("hard", ":.3f"),
+            "teacher_loss": AverageMeter("teacher", ":.3f"),
+            "q_loss": AverageMeter("q_pol", ":.3f"),
             "grad_norm": AverageMeter("grdn", ":.3f"),
             "lr": AverageMeter("lr", ":0.1e"),
             "update_s": AverageMeter("updt_s", ":.3f"),
@@ -452,7 +471,19 @@ def distill_pi0_deepspeed(cfg: DistillDeepSpeedPipelineConfig):
                 update_start_time = time.perf_counter()
 
             # Forward pass - DeepSpeed will handle the backward and optimizer steps
-            loss, output_dict = model_engine(
+            critic_loss , output_dict= model_engine.critic_forward(batch)
+            
+            model_engine.backward(critic_loss)
+            for param in actor_params:
+                param.grad = None
+            model_engine.step()
+            
+            model_engine.zero_grad()
+            if is_main_process:
+                train_tracker.critic_loss = critic_loss.item()
+                
+            
+            actor_loss, output_dict = model_engine(
                 batch, 
                 temperature=cfg.temperature,
                 soft_weight=cfg.soft_target_weight,
@@ -460,18 +491,22 @@ def distill_pi0_deepspeed(cfg: DistillDeepSpeedPipelineConfig):
             )
             
             # Backward and optimization (handled by DeepSpeed)
-            model_engine.backward(loss)
+            model_engine.backward(actor_loss)
+            for param in critic_params:
+                param.grad = None
             model_engine.step()
             
             # Track metrics (only on main process)
             if is_main_process:
-                train_tracker.loss = loss.item()
+                train_tracker.actor_loss = actor_loss.item()
                 if 'soft_loss' in output_dict:
                     train_tracker.soft_loss = output_dict['soft_loss']
                 if 'hard_loss' in output_dict:
                     train_tracker.hard_loss = output_dict['hard_loss']
                 if 'teacher_loss' in output_dict:
                     train_tracker.teacher_loss = output_dict['teacher_loss']
+                if 'q_loss' in output_dict:
+                    train_tracker.q_loss = output_dict['q_loss']
                 
                 # Get learning rate from optimizer
                 train_tracker.lr = model_engine.get_lr()[0] if hasattr(model_engine, 'get_lr') else model_engine.optimizer.param_groups[0]["lr"]
@@ -482,11 +517,14 @@ def distill_pi0_deepspeed(cfg: DistillDeepSpeedPipelineConfig):
                 # Update progress bar
                 if isinstance(progress_bar, tqdm):
                     progress_bar.set_postfix({
-                        'loss': f"{output_dict.get('total_loss', 0.0):.4f}",
+                        'actor_loss': f"{critic_loss.item():.3f}",
+                        'critic_loss': f"{actor_loss.item():.3f}",
                         'lr': f"{optimizer.param_groups[0]['lr']:.6f}"
                     })
                 
                 train_tracker.step()
+            
+            model_engine.update_target_critic()
             
             # Determine if this step needs logging, saving, or evaluation
             is_log_step = is_main_process and log_freq_steps > 0 and step % log_freq_steps == 0

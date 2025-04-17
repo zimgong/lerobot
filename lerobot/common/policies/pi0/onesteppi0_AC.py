@@ -56,6 +56,9 @@ class PI0OneStepACConfig(PI0Config):
     """Configuration for Pi0 one-step model."""
     type: str = "pi0_onestep_ac"
 
+    # def validate_features(self) -> None:
+        
+
 
 
 def make_att_2d_masks(pad_masks, att_masks):
@@ -252,9 +255,48 @@ class PI0OneStepModelCritic(nn.Module):
         # Instead of using this as a flow/velocity prediction,
         # we transform it into a direct action prediction
         actions = self.flow_model.action_out_proj(suffix_out)
+        
+        
+        
         score = self.lienar_prob(actions)  # Additional adaptation layer
         
         return score
+
+
+def resize_with_pad(img, width, height, pad_value=-1):
+    # assume no-op when width height fits already
+    if img.ndim != 4:
+        raise ValueError(f"(b,c,h,w) expected, but {img.shape}")
+
+    cur_height, cur_width = img.shape[2:]
+
+    ratio = max(cur_width / width, cur_height / height)
+    resized_height = int(cur_height / ratio)
+    resized_width = int(cur_width / ratio)
+    resized_img = F.interpolate(
+        img, size=(resized_height, resized_width), mode="bilinear", align_corners=False
+    )
+
+    pad_height = max(0, int(height - resized_height))
+    pad_width = max(0, int(width - resized_width))
+
+    # pad on left and top of image
+    padded_img = F.pad(resized_img, (pad_width, 0, pad_height, 0), value=pad_value)
+    return padded_img
+
+
+def pad_vector(vector, new_dim):
+    """Can be (batch_size x sequence_length x features_dimension)
+    or (batch_size x features_dimension)
+    """
+    if vector.shape[-1] == new_dim:
+        return vector
+    shape = list(vector.shape)
+    current_dim = shape[-1]
+    shape[-1] = new_dim
+    new_vector = torch.zeros(*shape, dtype=vector.dtype, device=vector.device)
+    new_vector[..., :current_dim] = vector
+    return new_vector
 
 class PI0OneStepACPolicy(PI0Policy):
     """Wrapper around PI0OneStepModel to use the same interface as PI0Policy"""
@@ -267,9 +309,20 @@ class PI0OneStepACPolicy(PI0Policy):
         super(PI0Policy, self).__init__(config)  # Call grandparent's init
         config.validate_features()
         self.config = config
+        self.discount = 0.9
+        # print(self.config)
+        # print(config.input_features)
+        # print(dataset_stats)
         
-        for input_feature in config.input_features:
-            config["next_" + input_feature] = config[input_feature]
+        input_features = list(config.input_features.keys()).copy()
+        
+        for input_feature in input_features:
+            config.input_features["next_" + input_feature] = config.input_features[input_feature]
+        
+        stats = list(dataset_stats.keys()).copy()
+        for stat in stats:
+            if stat.startswith("observation"):
+                dataset_stats["next_" + stat] = dataset_stats[stat]
         
         
         # Setup normalization components
@@ -296,9 +349,14 @@ class PI0OneStepACPolicy(PI0Policy):
         
     def make_critic(self):
         """Create the critic model"""
-        # Use the same architecture as PI0FlowMatching
+    # Use the same architecture as PI0FlowMatching
         self.critic = PI0OneStepModelCritic(self.config)
         missing_keys, unexpected_keys = self.critic.load_state_dict(self.model.state_dict(), strict=False)
+
+        # Freeze all parameters except the output head
+        for name, param in self.critic.named_parameters():
+            if "lienar_prob" not in name:  # Assuming "lienar_prob" is the output head
+                param.requires_grad = False
         print("Missing keys:", missing_keys)
         print("Unexpected keys:", unexpected_keys)
         
@@ -310,6 +368,15 @@ class PI0OneStepACPolicy(PI0Policy):
         
         # Set target critic to eval mode
         self.target_critic.eval()
+    
+    
+    def update_target_critic(self, tau=None):
+        """Update the target critic with the current critic weights"""
+        if tau == None:
+            tau = 0.05
+        
+        for target_param, param in zip(self.target_critic.parameters(), self.critic.parameters()):
+            target_param.data.copy_(tau * param.data + (1.0 - tau) * target_param.data)
     
     @torch.no_grad()
     def select_action(self, batch, noise=None):
@@ -344,15 +411,20 @@ class PI0OneStepACPolicy(PI0Policy):
             
         return self._action_queue.popleft()
     
-    def prepare_next_images(self, batch):
+    def prepare_images(self, batch):
         """Apply Pi0 preprocessing to the images, like resizing to 224x224 and padding to keep aspect ratio, and
         convert pixel range from [0.0, 1.0] to [-1.0, 1.0] as requested by SigLIP.
         """
         images = []
         img_masks = []
+        next_images = []
+        next_img_masks = []
 
         present_img_keys = [key for key in self.config.image_features if key in batch]
         missing_img_keys = [key for key in self.config.image_features if key not in batch]
+        
+        # print("present_img_keys:", present_img_keys)
+        # print("missing_img_keys:", missing_img_keys)
 
         if len(present_img_keys) == 0:
             raise ValueError(
@@ -372,8 +444,12 @@ class PI0OneStepACPolicy(PI0Policy):
             bsize = img.shape[0]
             device = img.device
             mask = torch.ones(bsize, dtype=torch.bool, device=device)
-            images.append(img)
-            img_masks.append(mask)
+            if key.startswith("next_"):
+                next_images.append(img)
+                next_img_masks.append(mask)
+            else:
+                images.append(img)
+                img_masks.append(mask)
 
         # Create image features not present in the batch
         # as fully 0 padded images.
@@ -382,19 +458,30 @@ class PI0OneStepACPolicy(PI0Policy):
                 break
             img = torch.ones_like(img) * -1
             mask = torch.zeros_like(mask)
-            images.append(img)
-            img_masks.append(mask)
+            if missing_img_keys[num_empty_cameras].startswith("next_"):
+                next_images.append(img)
+                next_img_masks.append(mask)
+            else:
+                images.append(img)
+                img_masks.append(mask)
 
-        return images, img_masks
-    def forward(self, batch, temperature=1.0, soft_weight=0.5, hard_weight=0.5):
-        """Forward pass for training with distillation"""
-        # Handle Pi-Aloha adaptation if needed
+        return images, img_masks , next_images, next_img_masks
+    
+    
+    def prepare_state(self, batch):
+        """Pad state"""
+        state = pad_vector(batch[OBS_ROBOT], self.config.max_state_dim)
+        next_state = pad_vector(batch["next_" + OBS_ROBOT], self.config.max_state_dim)
+        return state, next_state
+
+    def prepare_inputs(self, batch):
+        """Prepare inputs for the model"""
         if self.config.adapt_to_pi_aloha:
             batch[OBS_ROBOT] = self._pi_aloha_decode_state(batch[OBS_ROBOT])
             batch[ACTION] = self._pi_aloha_encode_actions_inv(batch[ACTION])
             
-        print(batch.keys())
-        print( self.config.image_features)
+        # print(batch.keys())
+        # print( self.config.image_features)
         # print(batch["next_observation.state"].keys())
         # for key in batch:
         #     if key.startswith("observation.images."):
@@ -404,38 +491,56 @@ class PI0OneStepACPolicy(PI0Policy):
         # Normalize inputs and targets
         batch = self.normalize_inputs(batch)
         batch = self.normalize_targets(batch)
-        
-        
-        
-        # Prepare inputs
-        images, img_masks = self.prepare_images(batch)
-        state = self.prepare_state(batch)
+        images, img_masks , next_images, next_img_masks = self.prepare_images(batch)
+        state, next_state = self.prepare_state(batch)
         lang_tokens, lang_masks = self.prepare_language(batch)
+        
+        return images, img_masks , next_images, next_img_masks, state, next_state, lang_tokens, lang_masks
+    
+    def critic_forward(self, batch):
+        
+        images, img_masks , next_images, next_img_masks, state, next_state, lang_tokens, lang_masks = self.prepare_inputs(batch)
         target_actions = self.prepare_action(batch)
         actions_is_pad = batch.get("actions_is_pad")
-        
-        # Get direct action predictions from student
-        pred_actions = self.model(images, img_masks, lang_tokens, lang_masks, state)
-        
-        
-        
-        
         loss_dict = {}
         
         
-        rewards = batch.get("reward")
+        reward_rate = batch.get("rwd_action_rate_l2")
+        reward_acc = batch.get("rwd_action_acceleration_l2")
+        rewards = -(reward_acc + reward_rate)
         with torch.no_grad():
-            pred_next_actions = self.model(next_images, next_img_masks, next_lang_tokens, next_lang_masks, next_state)
+            pred_next_actions = self.model(next_images, next_img_masks, lang_tokens, lang_masks, next_state)
             pred_next_actions = torch.clamp(pred_next_actions, min=0.0, max=1.0)
-            next_qs = self.target_critic(next_images, next_img_masks, next_lang_tokens, next_lang_masks, next_state, pred_next_actions)
-            next_q = next_qs.mean(dim=0)
-            target_q = rewards + self.discount * next_q
+            next_qs = self.target_critic(next_images, next_img_masks, lang_tokens, lang_masks, next_state, pred_next_actions)
+            # print(rewards.shape , next_qs.shape)
+            next_q = next_qs.squeeze()
+            # print("next_q:",next_q.shape,"rewards:",rewards.shape)
+            target_q = rewards.unsqueeze(1) + self.discount * next_q
         q = self.critic(images, img_masks, lang_tokens, lang_masks, state, target_actions)
         
-        critic_loss = F.mse_loss(q, target_q)
+        critic_loss = F.mse_loss(q.squeeze(), target_q)
         
         loss_dict["critic_loss"] = critic_loss.mean().item()
         
+        return critic_loss, loss_dict
+        
+        
+    
+    def forward(self, batch, temperature=1.0, soft_weight=0.5, hard_weight=0.5):
+        """Forward pass for training with distillation"""
+        # Handle Pi-Aloha adaptation if needed
+        
+        images, img_masks , next_images, next_img_masks, state, next_state, lang_tokens, lang_masks = self.prepare_inputs(batch)
+        target_actions = self.prepare_action(batch)
+        actions_is_pad = batch.get("actions_is_pad")
+        
+        
+        # Prepare inputs
+        
+        # Get direct action predictions from student
+        loss_dict = {}
+        
+        pred_actions = self.model(images, img_masks, lang_tokens, lang_masks, state)
         # Compute standard supervised loss with ground truth
         hard_loss = F.mse_loss(pred_actions, target_actions, reduction="none")
         # print("gt:",pred_actions.shape, target_actions.shape)
@@ -454,31 +559,41 @@ class PI0OneStepACPolicy(PI0Policy):
             # print("teacher:",pred_actions.shape, teacher_actions.shape)
             
             # Combine the two losses
-            losses = soft_weight * soft_loss + hard_weight * hard_loss
+            bc_loss = soft_weight * soft_loss + hard_weight * hard_loss
             loss_dict["soft_loss"] = soft_loss.mean().item()
             loss_dict["hard_loss"] = hard_loss.mean().item()
             loss_dict["teacher_loss"] = teacher_loss.mean().item()
         else:
             # If no teacher, just use the hard loss
-            losses = hard_loss
-            
-        pred_actions = torch.clamp(pred_actions, min=0.0, max=1.0)
-        qs = self.critic(images, img_masks, lang_tokens, lang_masks, state, pred_actions)
-        q = -qs.mean(dim=0)
-        losses = losses + -q
-        loss_dict["q_loss"] = q.mean().item()
+            bc_loss = hard_loss
         
         # Handle padding
         if actions_is_pad is not None:
             in_episode_bound = ~actions_is_pad
-            losses = losses * in_episode_bound.unsqueeze(-1)
+            bc_loss = bc_loss * in_episode_bound.unsqueeze(-1)
             
         # Remove padding
         original_action_dim = self.config.action_feature.shape[0]
-        losses = losses[:, :, :original_action_dim]
+        bc_loss = bc_loss[:, :, :original_action_dim]
         
         # Calculate final loss
-        loss = losses.mean()
-        loss_dict["total_loss"] = loss.item()
+        bc_loss = bc_loss.mean()
         
-        return loss, loss_dict
+        # print("bc_loss",bc_loss.shape)
+        
+        
+            
+        pred_actions = torch.clamp(pred_actions, min=0.0, max=1.0)
+        qs = self.critic(images, img_masks, lang_tokens, lang_masks, state, pred_actions)
+        q = -qs.mean()
+        
+        # print(q.shape)
+        loss_dict["q_loss"] = q.item()
+        
+        
+        actor_loss = bc_loss + q
+        
+        
+        loss_dict["actor_loss"] = actor_loss.item()
+        
+        return actor_loss, loss_dict
