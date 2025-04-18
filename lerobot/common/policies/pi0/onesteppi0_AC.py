@@ -507,7 +507,8 @@ class PI0OneStepACPolicy(PI0Policy):
         
         reward_rate = batch.get("rwd_action_rate_l2")
         reward_acc = batch.get("rwd_action_acceleration_l2")
-        rewards = -(reward_acc + reward_rate)
+        rewards = -(reward_acc + reward_rate)*1000
+        # print(rewards)
         with torch.no_grad():
             pred_next_actions = self.model(next_images, next_img_masks, lang_tokens, lang_masks, next_state)
             pred_next_actions = torch.clamp(pred_next_actions, min=0.0, max=1.0)

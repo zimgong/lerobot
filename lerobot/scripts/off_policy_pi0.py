@@ -114,6 +114,8 @@ class DistillDeepSpeedPipelineConfig(TrainPipelineConfig):
     deepspeed: bool = True
     deepspeed_config: Optional[str] = None
     local_rank: int = -1  # Will be set by DeepSpeed launcher
+    
+    only_critic: bool = False  # Only train the critic
 
 
 def create_ds_config(cfg):
@@ -409,25 +411,34 @@ def distill_pi0_deepspeed(cfg: DistillDeepSpeedPipelineConfig):
 
     # Define metrics to track (only on main process)
     if is_main_process:
-        train_metrics = {
-            "actor_loss": AverageMeter("actor", ":.3f"),
-            "critic_loss": AverageMeter("critic", ":.3f"),
-            "soft_loss": AverageMeter("soft", ":.3f"),
-            "hard_loss": AverageMeter("hard", ":.3f"),
-            "teacher_loss": AverageMeter("teacher", ":.3f"),
-            "q_loss": AverageMeter("q_pol", ":.3f"),
-            "grad_norm": AverageMeter("grdn", ":.3f"),
-            "lr": AverageMeter("lr", ":0.1e"),
-            "update_s": AverageMeter("updt_s", ":.3f"),
-            "dataloading_s": AverageMeter("data_s", ":.3f"),
-        }
+        if cfg.only_critic:
+            train_metrics = {
+                "critic_loss": AverageMeter("critic", ":.3f"),
+                "critic_grad_norm": AverageMeter("crit_grdn", ":.3f"),  # New critic grad norm metric
+                "lr": AverageMeter("lr", ":0.1e"),
+                "update_s": AverageMeter("updt_s", ":.3f"),
+                "dataloading_s": AverageMeter("data_s", ":.3f"),
+            }
+        else:
+            train_metrics = {
+                "actor_loss": AverageMeter("actor", ":.3f"),
+                "critic_loss": AverageMeter("critic", ":.3f"),
+                "soft_loss": AverageMeter("soft", ":.3f"),
+                "hard_loss": AverageMeter("hard", ":.3f"),
+                "teacher_loss": AverageMeter("teacher", ":.3f"),
+                "q_loss": AverageMeter("q_pol", ":.3f"),
+                "actor_grad_norm": AverageMeter("act_grdn", ":.3f"),  # New actor grad norm metric
+                "critic_grad_norm": AverageMeter("crit_grdn", ":.3f"),  # New critic grad norm metric
+                "lr": AverageMeter("lr", ":0.1e"),
+                "update_s": AverageMeter("updt_s", ":.3f"),
+                "dataloading_s": AverageMeter("data_s", ":.3f"),
+            }
 
         train_tracker = MetricsTracker(
             cfg.batch_size, dataset.num_frames, dataset.num_episodes, train_metrics, initial_step=step
         )
     else:
         train_tracker = None
-
     if is_main_process:
         logging.info("Start distillation training")
     
@@ -471,44 +482,66 @@ def distill_pi0_deepspeed(cfg: DistillDeepSpeedPipelineConfig):
                 update_start_time = time.perf_counter()
 
             # Forward pass - DeepSpeed will handle the backward and optimizer steps
-            critic_loss , output_dict= model_engine.critic_forward(batch)
-            
+            critic_loss, output_dict = model_engine.critic_forward(batch)
             model_engine.backward(critic_loss)
+
+            # Calculate critic gradient norm
+            if is_main_process:
+                critic_grad_norm = 0.0
+                for param in critic_params:
+                    if param.grad is not None:
+                        critic_grad_norm += param.grad.data.norm(2).item() ** 2
+                critic_grad_norm = critic_grad_norm ** 0.5
+                train_tracker.critic_grad_norm = critic_grad_norm
+
+            # Zero actor gradients and step optimizer
             for param in actor_params:
                 param.grad = None
             model_engine.step()
-            
             model_engine.zero_grad()
+
             if is_main_process:
                 train_tracker.critic_loss = critic_loss.item()
                 
-            
-            actor_loss, output_dict = model_engine(
-                batch, 
-                temperature=cfg.temperature,
-                soft_weight=cfg.soft_target_weight,
-                hard_weight=cfg.hard_target_weight
-            )
-            
-            # Backward and optimization (handled by DeepSpeed)
-            model_engine.backward(actor_loss)
-            for param in critic_params:
-                param.grad = None
-            model_engine.step()
-            
-            # Track metrics (only on main process)
-            if is_main_process:
-                train_tracker.actor_loss = actor_loss.item()
-                if 'soft_loss' in output_dict:
-                    train_tracker.soft_loss = output_dict['soft_loss']
-                if 'hard_loss' in output_dict:
-                    train_tracker.hard_loss = output_dict['hard_loss']
-                if 'teacher_loss' in output_dict:
-                    train_tracker.teacher_loss = output_dict['teacher_loss']
-                if 'q_loss' in output_dict:
-                    train_tracker.q_loss = output_dict['q_loss']
+            # Actor training step (if not only training critic)
+            if not cfg.only_critic:
+                actor_loss, output_dict = model_engine(
+                    batch, 
+                    temperature=cfg.temperature,
+                    soft_weight=cfg.soft_target_weight,
+                    hard_weight=cfg.hard_target_weight
+                )
                 
-                # Get learning rate from optimizer
+                # Backward pass
+                model_engine.backward(actor_loss)
+                
+                # Calculate actor gradient norm
+                if is_main_process:
+                    actor_grad_norm = 0.0
+                    for param in actor_params:
+                        if param.grad is not None:
+                            actor_grad_norm += param.grad.data.norm(2).item() ** 2
+                    actor_grad_norm = actor_grad_norm ** 0.5
+                    train_tracker.actor_grad_norm = actor_grad_norm
+                
+                # Zero critic gradients and step optimizer
+                for param in critic_params:
+                    param.grad = None
+                model_engine.step()
+                
+                if is_main_process:
+                    train_tracker.actor_loss = actor_loss.item()
+                    if 'soft_loss' in output_dict:
+                        train_tracker.soft_loss = output_dict['soft_loss']
+                    if 'hard_loss' in output_dict:
+                        train_tracker.hard_loss = output_dict['hard_loss']
+                    if 'teacher_loss' in output_dict:
+                        train_tracker.teacher_loss = output_dict['teacher_loss']
+                    if 'q_loss' in output_dict:
+                        train_tracker.q_loss = output_dict['q_loss']
+
+            # Update progress bar with gradient norm information
+            if is_main_process:
                 train_tracker.lr = model_engine.get_lr()[0] if hasattr(model_engine, 'get_lr') else model_engine.optimizer.param_groups[0]["lr"]
                 
                 # Calculate update time
@@ -516,15 +549,24 @@ def distill_pi0_deepspeed(cfg: DistillDeepSpeedPipelineConfig):
                 
                 # Update progress bar
                 if isinstance(progress_bar, tqdm):
-                    progress_bar.set_postfix({
-                        'actor_loss': f"{critic_loss.item():.3f}",
-                        'critic_loss': f"{actor_loss.item():.3f}",
-                        'lr': f"{optimizer.param_groups[0]['lr']:.6f}"
-                    })
+                    if cfg.only_critic:
+                        progress_bar.set_postfix({
+                            'critic_loss': f"{critic_loss.item():.3f}",
+                            'crit_grad': f"{train_tracker.critic_grad_norm:.3f}",
+                            'lr': f"{optimizer.param_groups[0]['lr']:.6f}"
+                        })
+                    else:
+                        progress_bar.set_postfix({
+                            'actor_loss': f"{actor_loss.item():.3f}",
+                            'critic_loss': f"{critic_loss.item():.3f}",
+                            'act_grad': f"{train_tracker.actor_grad_norm:.3f}",
+                            'crit_grad': f"{train_tracker.critic_grad_norm:.3f}",
+                            'lr': f"{optimizer.param_groups[0]['lr']:.6f}"
+                        })
                 
                 train_tracker.step()
-            
-            model_engine.update_target_critic()
+            if step % 100 == 0:
+                model_engine.update_target_critic()
             
             # Determine if this step needs logging, saving, or evaluation
             is_log_step = is_main_process and log_freq_steps > 0 and step % log_freq_steps == 0
