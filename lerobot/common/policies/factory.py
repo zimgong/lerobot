@@ -55,6 +55,14 @@ def get_policy_class(name: str) -> PreTrainedPolicy:
         from lerobot.common.policies.pi0.modeling_pi0 import PI0Policy
 
         return PI0Policy
+    elif name == "pi0_onestep":
+        from lerobot.common.policies.pi0.modeling_onesteppi0 import PI0OneStepPolicy
+
+        return PI0OneStepPolicy
+    elif name == "pi0_onestep_ac":
+        from lerobot.common.policies.pi0.onesteppi0_AC import PI0OneStepACPolicy
+
+        return PI0OneStepACPolicy
     elif name == "pi0fast":
         from lerobot.common.policies.pi0fast.modeling_pi0fast import PI0FASTPolicy
 
