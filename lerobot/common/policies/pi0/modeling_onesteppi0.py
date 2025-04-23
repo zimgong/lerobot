@@ -89,6 +89,7 @@ def make_att_2d_masks(pad_masks, att_masks):
     pad_2d_masks = pad_masks[:, None, :] * pad_masks[:, :, None]
     att_2d_masks = att_2d_masks & pad_2d_masks
     return att_2d_masks
+
 class PI0OneStepModel(nn.Module):
     """One-step distilled version of Pi0 that directly predicts actions"""
     
@@ -236,6 +237,33 @@ class PI0OneStepPolicy(PI0Policy):
             self._action_queue.extend(actions.transpose(0, 1))
             
         return self._action_queue.popleft()
+
+    
+    def act(self, batch, noise=None):
+        # wrap for PPO trainer
+        if self.config.adapt_to_pi_aloha:
+            batch[OBS_ROBOT] = self._pi_aloha_decode_state(batch[OBS_ROBOT])
+            
+        batch = self.normalize_inputs(batch)
+
+        images, img_masks = self.prepare_images(batch)
+        state = self.prepare_state(batch)
+        lang_tokens, lang_masks = self.prepare_language(batch)
+        
+        # Directly predict actions
+        actions = self.model(images, img_masks, lang_tokens, lang_masks, state)
+        
+        # Unpad actions
+        original_action_dim = self.config.action_feature.shape[0]
+        actions = actions[:, :, :original_action_dim]
+        
+        actions = self.unnormalize_outputs({"action": actions})["action"]
+        
+        if self.config.adapt_to_pi_aloha:
+            actions = self._pi_aloha_encode_actions(actions)
+
+        return actions
+
     
     def forward(self, batch, temperature=1.0, soft_weight=0.5, hard_weight=0.5):
         """Forward pass for training with distillation"""
