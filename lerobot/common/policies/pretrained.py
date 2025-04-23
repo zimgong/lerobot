@@ -197,3 +197,7 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         with caching.
         """
         raise NotImplementedError
+
+    def act(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
+        """Always do a forward pass and return the action. No caching."""
+        raise NotImplementedError
