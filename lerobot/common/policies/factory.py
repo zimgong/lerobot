@@ -59,6 +59,14 @@ def get_policy_class(name: str) -> PreTrainedPolicy:
         from lerobot.common.policies.pi0fast.modeling_pi0fast import PI0FASTPolicy
 
         return PI0FASTPolicy
+    elif name == "pi0_onestep":
+        from lerobot.common.policies.pi0.modeling_onesteppi0 import PI0OneStepPolicy
+
+        return PI0OneStepPolicy
+    elif name == "pi0_onestep_ac":
+        from lerobot.common.policies.pi0.onesteppi0_AC import PI0OneStepACPolicy
+
+        return PI0OneStepACPolicy
     else:
         raise NotImplementedError(f"Policy with name {name} is not implemented.")
 

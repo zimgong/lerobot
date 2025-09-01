@@ -25,6 +25,8 @@ from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
 @PreTrainedConfig.register_subclass("pi0")
 @dataclass
 class PI0Config(PreTrainedConfig):
+    device="cuda"
+    use_amp=False
     # Input / output structure.
     n_obs_steps: int = 1
     chunk_size: int = 50
