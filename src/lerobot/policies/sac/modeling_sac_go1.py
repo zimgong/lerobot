@@ -15,6 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import math
 from collections.abc import Callable
 from dataclasses import asdict
@@ -26,32 +27,55 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F  # noqa: N812
 from torch import Tensor
-from torch.distributions import MultivariateNormal, TanhTransform, Transform, TransformedDistribution
+from transformers import AutoTokenizer
 
 from lerobot.policies.pretrained import PreTrainedPolicy
-from lerobot.policies.sac.configuration_sac import SACConfig, is_image_feature
-from lerobot.policies.utils import get_device_from_parameters
+from lerobot.policies.sac.configuration_sac_go1 import SACGO1Config
+from lerobot.policies.sac.modeling_sac import MLP, orthogonal_init, TanhMultivariateNormalDiag
+from lerobot.policies.utils import get_device_from_parameters, get_dtype_from_parameters
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_STATE
 
+from go1.configs.go1_base_cfg import BaseSpaceArguments
+from go1.internvl.model.go1 import GO1Model, GO1ModelConfig
+from go1.internvl.train.constants import (
+    BOX_END_TOKEN,
+    BOX_START_TOKEN,
+    IMG_CONTEXT_TOKEN,
+    IMG_END_TOKEN,
+    IMG_START_TOKEN,
+    QUAD_END_TOKEN,
+    QUAD_START_TOKEN,
+    REF_END_TOKEN,
+    REF_START_TOKEN,
+)
+from go1.internvl.train.dataset import build_transform
+from go1.internvl.train.go1_train import build_ae_config, build_noise_scheduler_config
+from go1.lerobot.dataset_lerobot import tensor_to_pil, WrappedLeRobotDataset
+from go1.lerobot.dataset_transforms import make_conversation
+from go1.tools.env_parse import get_bool_env
+
 DISCRETE_DIMENSION_INDEX = -1  # Gripper is always the last dimension
+logger = logging.getLogger(__name__)
 
 
-class SACPolicy(
+class SACGO1Policy(
     PreTrainedPolicy,
 ):
-    config_class = SACConfig
-    name = "sac"
+    config_class = SACGO1Config
+    name = "sac_go1"
 
     def __init__(
         self,
-        config: SACConfig | None = None,
+        config: SACGO1Config | None = None,
     ):
         super().__init__(config)
         config.validate_features()
         self.config = config
 
         # Determine action dimension and initialize all components
+        space_dim = config.input_features[OBS_STATE].shape[0]
         continuous_action_dim = config.output_features[ACTION].shape[0]
+        self._init_go1_model(space_dim, continuous_action_dim)
         self._init_encoders()
         self._init_critics(continuous_action_dim)
         self._init_actor(continuous_action_dim)
@@ -85,15 +109,15 @@ class SACPolicy(
         """Select action for inference/evaluation"""
 
         observations_features = None
-        if self.shared_encoder and self.actor.encoder.has_images:
+        if self.shared_encoder:
             observations_features = self.actor.encoder.get_cached_image_features(batch)
 
-        actions, _, _ = self.actor(batch, observations_features)
+        actions, _, _ = self.actor(batch, observations_features["vlm_outputs"])
 
         if self.config.num_discrete_actions is not None:
-            discrete_action_value = self.discrete_critic(batch, observations_features)
+            discrete_action_value = self.discrete_critic(batch, observations_features["vlm_features"])
             discrete_action = torch.argmax(discrete_action_value, dim=-1, keepdim=True)
-            actions = torch.cat([actions, discrete_action], dim=-1)
+            actions = torch.cat([actions[:,0,:], discrete_action], dim=-1)
 
         return actions
 
@@ -388,12 +412,147 @@ class SACPolicy(
         actor_loss = ((self.temperature * log_probs) - min_q_preds).mean()
         return actor_loss
 
+    def _init_go1_model(self, space_dim, continuous_action_dim):
+        """Initialize GO-1 VLM model and configure freezing."""
+        model_args = self.config.go1_model_kwargs
+        space_args = BaseSpaceArguments()
+        space_args.state_dim = space_dim
+        space_args.action_dim = continuous_action_dim
+        space_args.space_repack = self.config.space_repack
+        space_args.ctrl_freq = self.config.ctrl_freq
+
+        # Load pretrained model, tokenizer, and image processor
+        tokenizer_path = model_args.model_name_or_path or model_args.llm_path
+        logger.info(f"Loading Tokenizer: {tokenizer_path}")
+        tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_path,
+            add_eos_token=False,
+            trust_remote_code=True,
+            use_fast=model_args.use_fast_tokenizer,
+        )
+        tokenizer.tokenizer_path = tokenizer_path
+        tokenizer.model_max_length = model_args.max_seq_length
+        token_list = [
+            IMG_START_TOKEN,
+            IMG_END_TOKEN,
+            IMG_CONTEXT_TOKEN,
+            QUAD_START_TOKEN,
+            QUAD_END_TOKEN,
+            REF_START_TOKEN,
+            REF_END_TOKEN,
+            BOX_START_TOKEN,
+            BOX_END_TOKEN,
+        ]
+        num_new_tokens = tokenizer.add_tokens(token_list, special_tokens=True)
+        img_context_token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
+
+        # Determine training backend data dtype and model weights dtype
+        torch_dtype = torch.bfloat16
+
+        # Load model state dict from given model safetensor directory
+        logger.info("Loading GO1Model...")
+        # config = GO1ModelConfig.from_pretrained(model_args.model_name_or_path)
+        config = GO1ModelConfig()
+        config.llm_config.architectures = ["InternLM2ForCausalLMGO1"]
+        config.vision_config.drop_path_rate = model_args.drop_path_rate
+        config.llm_config.attn_implementation = "flash_attention_2"  # for InternLM
+        config.pad_token_id = tokenizer.pad_token_id
+        config.template = model_args.conv_style
+        config.select_layer = model_args.vision_select_layer
+        config.dynamic_image_size = model_args.dynamic_image_size
+        config.use_thumbnail = model_args.use_thumbnail
+        config.ps_version = model_args.ps_version
+        config.min_dynamic_patch = model_args.min_dynamic_patch
+        config.max_dynamic_patch = model_args.max_dynamic_patch
+        config.img_context_token_id = img_context_token_id
+
+        # rewrite the config for GO1
+        ae_config = build_ae_config(model_args, config, space_args)
+        config.action_config = ae_config
+        config.action_chunk_size = ae_config.action_chunk_size
+        noise_scheduler_config = build_noise_scheduler_config(model_args)
+        config.noise_scheduler_config = noise_scheduler_config
+        config.norm = True
+
+        # Add latent planner related config
+        if model_args.latent_planning:
+            assert config.latent_planner_config.state_token_num == 0
+            config.latent_planner_config.action_dim = 1  # codebook size is 32, and we need to do cross-entropy loss
+            config.latent_planning = model_args.latent_planning
+
+        model = GO1Model.from_pretrained(
+            model_args.model_name_or_path,
+            config=config,
+            torch_dtype=torch_dtype,
+            _fast_init=get_bool_env(name="DEBUG_MODE"),
+            ignore_mismatched_sizes=True,
+        )
+
+        assert model.config.downsample_ratio == model_args.down_sample_ratio
+        patch_size = model.config.vision_config.patch_size
+        logger.info(f"model.config.force_image_size: {model.config.force_image_size}")
+        logger.info(f"model_args.force_image_size: {model_args.force_image_size}")
+        logger.info(f"model.config.vision_config.image_size: {model.config.vision_config.image_size}")
+        if model.config.vision_config.image_size != model_args.force_image_size:
+            logger.info(
+                f"Resizing position embedding from "
+                f"{model.config.vision_config.image_size} "
+                f"to {model_args.force_image_size}..."
+            )
+            model.vision_model.resize_pos_embeddings(
+                old_size=model.config.vision_config.image_size,
+                new_size=model_args.force_image_size,
+                patch_size=patch_size,
+            )
+            model.config.vision_config.image_size = model_args.force_image_size
+        model.config.force_image_size = model_args.force_image_size
+        model.num_image_token = int((model_args.force_image_size // patch_size) ** 2 * (model_args.down_sample_ratio**2))
+
+        if num_new_tokens > 0:
+            model.language_model.resize_token_embeddings(len(tokenizer))
+            output_embeddings = model.language_model.get_output_embeddings().weight.data
+            output_embeddings_avg = output_embeddings[:-num_new_tokens].mean(dim=0, keepdim=True)
+            output_embeddings[-num_new_tokens:] = output_embeddings_avg
+
+            model.config.llm_config.vocab_size = len(tokenizer)
+            model.language_model.config.vocab_size = len(tokenizer)
+
+        model.language_model.config.use_cache = True
+        model.vision_model.gradient_checkpointing = True
+        model.vision_model.encoder.gradient_checkpointing = True
+        model.language_model._set_output_logits(model_args.output_logits)
+        if model_args.grad_checkpoint:
+            model.language_model._set_gradient_checkpointing()
+            model.latent_planner._set_gradient_checkpointing()
+            model.action_model._set_gradient_checkpointing()
+
+        # Model freeze params operation
+        def _freeze_params(module):
+            for param in module.parameters():
+                param.requires_grad = False
+
+        if model_args.freeze_backbone:
+            _freeze_params(model.vision_model)
+
+        if model_args.freeze_llm:
+            model.language_model = model.language_model.eval()
+            _freeze_params(model.language_model)
+
+        if model_args.freeze_mlp:
+            _freeze_params(model.mlp1)
+
+        if model_args.freeze_latent_planner:
+            _freeze_params(model.latent_planner)
+
+        self.tokenizer = tokenizer
+        self.go1_model = model
+
     def _init_encoders(self):
         """Initialize shared or separate encoders for actor and critic."""
         self.shared_encoder = self.config.shared_encoder
-        self.encoder_critic = SACObservationEncoder(self.config)
+        self.encoder_critic = SACObservationEncoder(self.config, self.tokenizer, self.go1_model)
         self.encoder_actor = (
-            self.encoder_critic if self.shared_encoder else SACObservationEncoder(self.config)
+            self.encoder_critic if self.shared_encoder else SACObservationEncoder(self.config, self.tokenizer, self.go1_model)
         )
 
     def _init_critics(self, continuous_action_dim):
@@ -446,9 +605,10 @@ class SACPolicy(
         # NOTE: The actor select only the continuous action part
         self.actor = Policy(
             encoder=self.encoder_actor,
-            network=MLP(input_dim=self.encoder_actor.output_dim, **asdict(self.config.actor_network_kwargs)),
+            network=self.go1_model,
             action_dim=continuous_action_dim,
             encoder_is_shared=self.shared_encoder,
+            ctrl_freq=self.config.ctrl_freq,
             **asdict(self.config.policy_kwargs),
         )
 
@@ -465,102 +625,42 @@ class SACPolicy(
 
 
 class SACObservationEncoder(nn.Module):
-    """Encode image and/or state vector observations."""
+    """Encode image and/or state vector observations.Encode VLM observations using last layer key-value pairs.
+    
+    This encoder extracts key-value pairs from the last transformer layer of the VLM
+    and pools them to create a compact representation for the critic head. The design
+    reduces the high-dimensional key-value cache to a manageable size while preserving
+    the most relevant information from the VLM's final layer.
+    
+    The output dimension is 2 * head_dim, where head_dim is the dimension per attention
+    head. This comes from concatenating the pooled key and value vectors.
+    """
 
-    def __init__(self, config: SACConfig) -> None:
+    def __init__(self, config: SACGO1Config, tokenizer, vla_model) -> None:
         super().__init__()
         self.config = config
-        self._init_image_layers()
-        self._init_state_layers()
+        self.tokenizer = tokenizer
+        self.vla_model = vla_model
+        self.head_dim = self.vla_model.language_model.config.hidden_size // self.vla_model.language_model.config.num_attention_heads
+        self.mlp_head = MLP(input_dim=2 * self.head_dim, hidden_dims=[4 * self.head_dim, 2 * self.head_dim], activate_final=True, final_activation=None)
         self._compute_output_dim()
 
-    def _init_image_layers(self) -> None:
-        self.image_keys = [k for k in self.config.input_features if is_image_feature(k)]
-        self.has_images = bool(self.image_keys)
-        if not self.has_images:
-            return
-
-        if self.config.vision_encoder_name is not None:
-            self.image_encoder = PretrainedImageEncoder(self.config)
-        else:
-            self.image_encoder = DefaultImageEncoder(self.config)
-
-        if self.config.freeze_vision_encoder:
-            freeze_image_encoder(self.image_encoder)
-
-        dummy = torch.zeros(1, *self.config.input_features[self.image_keys[0]].shape)
-        with torch.no_grad():
-            _, channels, height, width = self.image_encoder(dummy).shape
-
-        self.spatial_embeddings = nn.ModuleDict()
-        self.post_encoders = nn.ModuleDict()
-
-        for key in self.image_keys:
-            name = key.replace(".", "_")
-            self.spatial_embeddings[name] = SpatialLearnedEmbeddings(
-                height=height,
-                width=width,
-                channel=channels,
-                num_features=self.config.image_embedding_pooling_dim,
-            )
-            self.post_encoders[name] = nn.Sequential(
-                nn.Dropout(0.1),
-                nn.Linear(
-                    in_features=channels * self.config.image_embedding_pooling_dim,
-                    out_features=self.config.latent_dim,
-                ),
-                nn.LayerNorm(normalized_shape=self.config.latent_dim),
-                nn.Tanh(),
-            )
-
-    def _init_state_layers(self) -> None:
-        self.has_env = OBS_ENV_STATE in self.config.input_features
-        self.has_state = OBS_STATE in self.config.input_features
-        if self.has_env:
-            dim = self.config.input_features[OBS_ENV_STATE].shape[0]
-            self.env_encoder = nn.Sequential(
-                nn.Linear(dim, self.config.latent_dim),
-                nn.LayerNorm(self.config.latent_dim),
-                nn.Tanh(),
-            )
-        if self.has_state:
-            dim = self.config.input_features[OBS_STATE].shape[0]
-            self.state_encoder = nn.Sequential(
-                nn.Linear(dim, self.config.latent_dim),
-                nn.LayerNorm(self.config.latent_dim),
-                nn.Tanh(),
-            )
-
     def _compute_output_dim(self) -> None:
-        out = 0
-        if self.has_images:
-            out += len(self.image_keys) * self.config.latent_dim
-        if self.has_env:
-            out += self.config.latent_dim
-        if self.has_state:
-            out += self.config.latent_dim
-        self._out_dim = out
+        # Extract last layer key-value pairs for critic input
+        # Each key/value has shape: (batch_size, num_heads, seq_len, head_dim)
+        # We'll pool across sequence length and heads to get: (batch_size, head_dim)
+        # Use both key and value from last layer, so 2 * head_dim
+        # Then pass through MLP head which outputs 256 dimensions
+        self._out_dim = 2 * self.head_dim  # Output dimension of the MLP head
 
     def forward(
         self, obs: dict[str, Tensor], cache: dict[str, Tensor] | None = None, detach: bool = False
-    ) -> Tensor:
-        parts = []
-        if self.has_images:
-            if cache is None:
-                cache = self.get_cached_image_features(obs)
-            parts.append(self._encode_images(cache, detach))
-        if self.has_env:
-            parts.append(self.env_encoder(obs[OBS_ENV_STATE]))
-        if self.has_state:
-            parts.append(self.state_encoder(obs[OBS_STATE]))
-        if parts:
-            return torch.cat(parts, dim=-1)
+    ):
+        if cache is None:
+            cache = self.get_cached_image_features(obs, detach)
+        return cache
 
-        raise ValueError(
-            "No parts to concatenate, you should have at least one image or environment state or state"
-        )
-
-    def get_cached_image_features(self, obs: dict[str, Tensor]) -> dict[str, Tensor]:
+    def get_cached_image_features(self, obs: dict[str, Tensor], detach: bool = False) -> dict[str, Tensor]:
         """Extract and optionally cache image features from observations.
 
         This function processes image observations through the vision encoder once and returns
@@ -583,10 +683,106 @@ class SACObservationEncoder(nn.Module):
         Returns:
             Dictionary mapping image keys to their corresponding encoded features
         """
-        batched = torch.cat([obs[k] for k in self.image_keys], dim=0)  # [2 * B, C, H, W]
-        out = self.image_encoder(batched)  # [2 *B, C, d_out, d_out]
-        chunks = torch.chunk(out, len(self.image_keys), dim=0)
-        return dict(zip(self.image_keys, chunks, strict=False))
+        if "cam_head_color" in self.config.space_repack:
+            obs["cam_head_color"] = tensor_to_pil(
+                obs[self.config.space_repack["cam_head_color"]].squeeze(0).permute(1, 2, 0)
+            )
+        if "cam_hand_right_color" in self.config.space_repack:
+            obs["cam_hand_right_color"] = tensor_to_pil(
+                obs[self.config.space_repack["cam_hand_right_color"]].squeeze(0).permute(1, 2, 0)
+            )
+        if "cam_hand_left_color" in self.config.space_repack:
+            obs["cam_hand_left_color"] = tensor_to_pil(
+                obs[self.config.space_repack["cam_hand_left_color"]].squeeze(0).permute(1, 2, 0)
+            )
+        if "final_prompt" in self.config.space_repack:
+            obs["final_prompt"] = tensor_to_pil(
+                obs[self.config.space_repack["final_prompt"]].squeeze(0).permute(1, 2, 0)
+            )
+        else:
+            obs["final_prompt"] = self.config.default_prompt
+        obs["final_prompt"] = make_conversation(prompt=obs["final_prompt"])
+
+        transform = build_transform(
+            is_train=True,
+            input_size=self.vla_model.config.force_image_size,
+            pad2square=self.vla_model.config.pad2square,
+            normalize_type="imagenet"
+        )
+        observation_features = WrappedLeRobotDataset.multi_image_get_item(
+            raw_target=obs,
+            img_transform=transform,
+            text_tokenizer=self.tokenizer,
+            num_image_token=self.vla_model.num_image_token,
+            use_thumbnail=self.vla_model.config.use_thumbnail,
+            min_dynamic_patch=self.vla_model.config.min_dynamic_patch,
+            max_dynamic_patch=self.vla_model.config.max_dynamic_patch,
+            image_size=self.vla_model.config.force_image_size,
+        )
+
+        if "cam_head_color" in obs:
+            obs.pop("cam_head_color")
+        if "cam_hand_right_color" in obs:
+            obs.pop("cam_hand_right_color")
+        if "cam_hand_left_color" in obs:
+            obs.pop("cam_hand_left_color")
+        if "final_prompt" in obs:
+            obs.pop("final_prompt")
+
+        pixel_values = observation_features["pixel_values"].to(dtype=self.vla_model.dtype, device=self.vla_model.device)
+        input_ids = observation_features["input_ids"].unsqueeze(0).to(self.vla_model.device)
+        attention_mask = observation_features["attention_mask"].unsqueeze(0).to(self.vla_model.device)
+        position_ids = observation_features["position_ids"].unsqueeze(0).to(self.vla_model.device)
+        image_flags = observation_features["image_flags"].to(self.vla_model.device)
+        labels = observation_features["labels"].unsqueeze(0).to(self.vla_model.device)
+
+        vlm_outputs = self.vla_model.common_process(
+            pixel_values=pixel_values,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            image_flags=image_flags,
+            return_dict=None,
+            labels=labels,
+        )
+        vlm_outputs.attention_mask = attention_mask
+        if detach:
+            vlm_outputs = vlm_outputs.detach()
+        
+        # Extract last layer key-value pairs
+        # past_key_values is a tuple of (key, value) pairs for each layer
+        last_layer_kv = vlm_outputs.past_key_values[-1]  # Get last layer
+        last_key, last_value = last_layer_kv  # Unpack key and value
+        
+        # Apply attention mask to avoid pooling over padding tokens
+        # attention_mask shape: (batch_size, seq_len)
+        if attention_mask is not None:
+            # Expand attention mask to match key/value dimensions
+            # Shape: (batch_size, 1, seq_len, 1) for broadcasting
+            mask_expanded = attention_mask.unsqueeze(1).unsqueeze(-1)
+            
+            # Apply mask and compute masked mean
+            masked_key = last_key * mask_expanded
+            masked_value = last_value * mask_expanded
+            
+            # Sum over sequence length and heads, then divide by number of valid tokens
+            valid_tokens = mask_expanded.sum(dim=(1, 2), keepdim=True)  # (batch_size, 1, 1, 1)
+            pooled_key = masked_key.sum(dim=(1, 2)) / (valid_tokens.squeeze(-1) + 1e-8)
+            pooled_value = masked_value.sum(dim=(1, 2)) / (valid_tokens.squeeze(-1) + 1e-8)
+        else:
+            # Fallback to simple mean pooling if no attention mask
+            pooled_key = last_key.mean(dim=(1, 2))  # Average over heads and sequence length
+            pooled_value = last_value.mean(dim=(1, 2))  # Average over heads and sequence length
+        
+        # Concatenate key and value features
+        # Shape: (batch_size, 2 * head_dim)
+        kv_features = torch.cat([pooled_key, pooled_value], dim=-1).squeeze(1)
+        
+        # Pass through MLP head to get final features
+        # Shape: (batch_size, 256)
+        vlm_features = self.mlp_head(kv_features)
+
+        return {"vlm_outputs": vlm_outputs, "vlm_features": vlm_features}
 
     def _encode_images(self, cache: dict[str, Tensor], detach: bool) -> Tensor:
         """Encode image features from cached observations.
@@ -603,76 +799,11 @@ class SACObservationEncoder(nn.Module):
         Returns:
             Tensor: The encoded image features.
         """
-        feats = []
-        for k, feat in cache.items():
-            safe_key = k.replace(".", "_")
-            x = self.spatial_embeddings[safe_key](feat)
-            x = self.post_encoders[safe_key](x)
-            if detach:
-                x = x.detach()
-            feats.append(x)
-        return torch.cat(feats, dim=-1)
+        pass
 
     @property
     def output_dim(self) -> int:
         return self._out_dim
-
-
-class MLP(nn.Module):
-    """Multi-layer perceptron builder.
-
-    Dynamically constructs a sequence of layers based on `hidden_dims`:
-      1) Linear (in_dim -> out_dim)
-      2) Optional Dropout if `dropout_rate` > 0 and (not final layer or `activate_final`)
-      3) LayerNorm on the output features
-      4) Activation (standard for intermediate layers, `final_activation` for last layer if `activate_final`)
-
-    Arguments:
-        input_dim (int): Size of input feature dimension.
-        hidden_dims (list[int]): Sizes for each hidden layer.
-        activations (Callable or str): Activation to apply between layers.
-        activate_final (bool): Whether to apply activation at the final layer.
-        dropout_rate (Optional[float]): Dropout probability applied before normalization and activation.
-        final_activation (Optional[Callable or str]): Activation for the final layer when `activate_final` is True.
-
-    For each layer, `in_dim` is updated to the previous `out_dim`. All constructed modules are
-    stored in `self.net` as an `nn.Sequential` container.
-    """
-
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dims: list[int],
-        activations: Callable[[torch.Tensor], torch.Tensor] | str = nn.SiLU(),
-        activate_final: bool = False,
-        dropout_rate: float | None = None,
-        final_activation: Callable[[torch.Tensor], torch.Tensor] | str | None = None,
-    ):
-        super().__init__()
-        layers: list[nn.Module] = []
-        in_dim = input_dim
-        total = len(hidden_dims)
-
-        for idx, out_dim in enumerate(hidden_dims):
-            # 1) linear transform
-            layers.append(nn.Linear(in_dim, out_dim))
-
-            is_last = idx == total - 1
-            # 2-4) optionally add dropout, normalization, and activation
-            if not is_last or activate_final:
-                if dropout_rate and dropout_rate > 0:
-                    layers.append(nn.Dropout(p=dropout_rate))
-                layers.append(nn.LayerNorm(out_dim))
-                act_cls = final_activation if is_last and final_activation else activations
-                act = act_cls if isinstance(act_cls, nn.Module) else getattr(nn, act_cls)()
-                layers.append(act)
-
-            in_dim = out_dim
-
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
 
 
 class CriticHead(nn.Module):
@@ -736,8 +867,10 @@ class CriticEnsemble(nn.Module):
         observation_features: torch.Tensor | None = None,
     ) -> torch.Tensor:
         device = get_device_from_parameters(self)
-        # Move each tensor in observations to device
-        observations = {k: v.to(device) for k, v in observations.items()}
+        dtype = get_dtype_from_parameters(self)
+        # Move each tensor in observations to device and dtype
+        observations = {k: v.to(device=device, dtype=dtype) for k, v in observations.items()}
+        actions = actions.to(device=device, dtype=dtype)
 
         obs_enc = self.encoder(observations, cache=observation_features)
 
@@ -789,8 +922,6 @@ class DiscreteCritic(nn.Module):
     def forward(
         self, observations: torch.Tensor, observation_features: torch.Tensor | None = None
     ) -> torch.Tensor:
-        device = get_device_from_parameters(self)
-        observations = {k: v.to(device) for k, v in observations.items()}
         obs_enc = self.encoder(observations, cache=observation_features)
         return self.output_layer(self.net(obs_enc))
 
@@ -807,6 +938,7 @@ class Policy(nn.Module):
         init_final: float | None = None,
         use_tanh_squash: bool = False,
         encoder_is_shared: bool = False,
+        ctrl_freq = None,
     ):
         super().__init__()
         self.encoder: SACObservationEncoder = encoder
@@ -817,12 +949,9 @@ class Policy(nn.Module):
         self.fixed_std = fixed_std
         self.use_tanh_squash = use_tanh_squash
         self.encoder_is_shared = encoder_is_shared
-
+        self.ctrl_freq = ctrl_freq
         # Find the last Linear layer's output dimension
-        for layer in reversed(network.net):
-            if isinstance(layer, nn.Linear):
-                out_features = layer.out_features
-                break
+        out_features = self.network.config.action_config.hidden_size
         # Mean layer
         self.mean_layer = nn.Linear(out_features, action_dim)
         if init_final is not None:
@@ -847,15 +976,67 @@ class Policy(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # We detach the encoder if it is shared to avoid backprop through it
         # This is important to avoid the encoder to be updated through the policy
+        attention_mask = observation_features.attention_mask
         obs_enc = self.encoder(observations, cache=observation_features, detach=self.encoder_is_shared)
 
         # Get network outputs
-        outputs = self.network(obs_enc)
-        means = self.mean_layer(outputs)
+        state = observations[OBS_STATE].to(dtype=self.network.dtype).unsqueeze(1)
+        B = state.shape[0]
+        ctrl_freqs = torch.full((B, 1), self.ctrl_freq, dtype=self.network.dtype, device=state.device)
+
+        # Project vlm kv_cache head dim into action expert head dim
+        vlm_key_values = obs_enc.past_key_values  # kv_cache(multi_head) of each decoder layer
+
+        vlm_key_values_downsample = []
+        for vlm_key_value, k_proj, v_proj in zip(vlm_key_values, self.network.k_proj_layers, self.network.v_proj_layers):
+            vlm_key_values_downsample.append((k_proj(vlm_key_value[0]), v_proj(vlm_key_value[1])))
+
+        if self.network.enable_lam:
+            (
+                latent_vlm_key_values_downsample,
+                outputs_latent,
+            ) = self.network.latent_planner(
+                vlm_key_values_downsample,
+                attention_mask,
+            )
+
+        # Sample noise that we'll add to the actions
+        dummy_action = torch.zeros(B, self.network.config.action_chunk_size, self.network.action_dim, dtype=self.network.dtype, device=state.device)
+        noise = torch.randn(dummy_action.shape, dtype=self.network.dtype, device=state.device)
+        timesteps = torch.randint(0, self.network.num_train_timesteps, (B, 1), device=state.device).long()
+        timestep_tokens = self.network.time_embedder(timesteps)
+        freq_tokens = self.network.freq_embedder(ctrl_freqs)
+        noisy_action = self.network.noise_scheduler.add_noise(dummy_action, noise, timesteps)
+
+        state_trajs = self.network.state_adaptor(state)
+        action_trajs = self.network.action_adaptor(noisy_action)
+        state_action_trajs = torch.cat([state_trajs, action_trajs], dim=1)
+
+        state_action_trajs_w_tfps = torch.cat(
+            [timestep_tokens, freq_tokens, state_action_trajs], dim=1
+        )
+
+        # Action expert as diffusion head
+        if self.network.enable_lam:
+            vlm_key_values_downsample = latent_vlm_key_values_downsample
+            attention_mask = torch.cat(
+                (
+                    attention_mask,
+                    torch.ones(
+                        B, self.network.latent_planner.latent_token_nums, dtype=torch.bool, device=attention_mask.device
+                    ),
+                ),
+                dim=1,
+            )
+
+        outputs = self.network.action_model(state_action_trajs_w_tfps, attention_mask, vlm_key_values_downsample)
+        state_action_output_tokens = outputs[0].to(dtype=self.mean_layer.weight.dtype)
+        action_output_tokens = state_action_output_tokens[:, -self.network.action_chunk_size :, ...]
+        means = self.mean_layer(action_output_tokens)
 
         # Compute standard deviations
         if self.fixed_std is None:
-            log_std = self.std_layer(outputs)
+            log_std = self.std_layer(action_output_tokens)
             std = torch.exp(log_std)  # Match JAX "exp"
             std = torch.clamp(std, self.std_min, self.std_max)  # Match JAX default clip
         else:
@@ -874,190 +1055,4 @@ class Policy(nn.Module):
 
     def get_features(self, observations: torch.Tensor) -> torch.Tensor:
         """Get encoded features from observations"""
-        device = get_device_from_parameters(self)
-        observations = observations.to(device)
-        if self.encoder is not None:
-            with torch.inference_mode():
-                return self.encoder(observations)
-        return observations
-
-
-class DefaultImageEncoder(nn.Module):
-    def __init__(self, config: SACConfig):
-        super().__init__()
-        image_key = next(key for key in config.input_features if is_image_feature(key))
-        self.image_enc_layers = nn.Sequential(
-            nn.Conv2d(
-                in_channels=config.input_features[image_key].shape[0],
-                out_channels=config.image_encoder_hidden_dim,
-                kernel_size=7,
-                stride=2,
-            ),
-            nn.ReLU(),
-            nn.Conv2d(
-                in_channels=config.image_encoder_hidden_dim,
-                out_channels=config.image_encoder_hidden_dim,
-                kernel_size=5,
-                stride=2,
-            ),
-            nn.ReLU(),
-            nn.Conv2d(
-                in_channels=config.image_encoder_hidden_dim,
-                out_channels=config.image_encoder_hidden_dim,
-                kernel_size=3,
-                stride=2,
-            ),
-            nn.ReLU(),
-            nn.Conv2d(
-                in_channels=config.image_encoder_hidden_dim,
-                out_channels=config.image_encoder_hidden_dim,
-                kernel_size=3,
-                stride=2,
-            ),
-            nn.ReLU(),
-        )
-
-    def forward(self, x):
-        x = self.image_enc_layers(x)
-        return x
-
-
-def freeze_image_encoder(image_encoder: nn.Module):
-    """Freeze all parameters in the encoder"""
-    for param in image_encoder.parameters():
-        param.requires_grad = False
-
-
-class PretrainedImageEncoder(nn.Module):
-    def __init__(self, config: SACConfig):
-        super().__init__()
-
-        self.image_enc_layers, self.image_enc_out_shape = self._load_pretrained_vision_encoder(config)
-
-    def _load_pretrained_vision_encoder(self, config: SACConfig):
-        """Set up CNN encoder"""
-        from transformers import AutoModel
-
-        self.image_enc_layers = AutoModel.from_pretrained(config.vision_encoder_name, trust_remote_code=True)
-
-        if hasattr(self.image_enc_layers.config, "hidden_sizes"):
-            self.image_enc_out_shape = self.image_enc_layers.config.hidden_sizes[-1]  # Last channel dimension
-        elif hasattr(self.image_enc_layers, "fc"):
-            self.image_enc_out_shape = self.image_enc_layers.fc.in_features
-        else:
-            raise ValueError("Unsupported vision encoder architecture, make sure you are using a CNN")
-        return self.image_enc_layers, self.image_enc_out_shape
-
-    def forward(self, x):
-        enc_feat = self.image_enc_layers(x).last_hidden_state
-        return enc_feat
-
-
-def orthogonal_init():
-    return lambda x: torch.nn.init.orthogonal_(x, gain=1.0)
-
-
-class SpatialLearnedEmbeddings(nn.Module):
-    def __init__(self, height, width, channel, num_features=8):
-        """
-        PyTorch implementation of learned spatial embeddings
-
-        Args:
-            height: Spatial height of input features
-            width: Spatial width of input features
-            channel: Number of input channels
-            num_features: Number of output embedding dimensions
-        """
-        super().__init__()
-        self.height = height
-        self.width = width
-        self.channel = channel
-        self.num_features = num_features
-
-        self.kernel = nn.Parameter(torch.empty(channel, height, width, num_features))
-
-        nn.init.kaiming_normal_(self.kernel, mode="fan_in", nonlinearity="linear")
-
-    def forward(self, features):
-        """
-        Forward pass for spatial embedding
-
-        Args:
-            features: Input tensor of shape [B, C, H, W] where B is batch size,
-                     C is number of channels, H is height, and W is width
-        Returns:
-            Output tensor of shape [B, C*F] where F is the number of features
-        """
-
-        features_expanded = features.unsqueeze(-1)  # [B, C, H, W, 1]
-        kernel_expanded = self.kernel.unsqueeze(0)  # [1, C, H, W, F]
-
-        # Element-wise multiplication and spatial reduction
-        output = (features_expanded * kernel_expanded).sum(dim=(2, 3))  # Sum over H,W dimensions
-
-        # Reshape to combine channel and feature dimensions
-        output = output.view(output.size(0), -1)  # [B, C*F]
-
-        return output
-
-
-class RescaleFromTanh(Transform):
-    def __init__(self, low: float = -1, high: float = 1):
-        super().__init__()
-
-        self.low = low
-
-        self.high = high
-
-    def _call(self, x):
-        # Rescale from (-1, 1) to (low, high)
-
-        return 0.5 * (x + 1.0) * (self.high - self.low) + self.low
-
-    def _inverse(self, y):
-        # Rescale from (low, high) back to (-1, 1)
-
-        return 2.0 * (y - self.low) / (self.high - self.low) - 1.0
-
-    def log_abs_det_jacobian(self, x, y):
-        # log|d(rescale)/dx| = sum(log(0.5 * (high - low)))
-
-        scale = 0.5 * (self.high - self.low)
-
-        return torch.sum(torch.log(scale), dim=-1)
-
-
-class TanhMultivariateNormalDiag(TransformedDistribution):
-    def __init__(self, loc, scale_diag, low=None, high=None):
-        base_dist = MultivariateNormal(loc, torch.diag_embed(scale_diag))
-
-        transforms = [TanhTransform(cache_size=1)]
-
-        if low is not None and high is not None:
-            low = torch.as_tensor(low)
-
-            high = torch.as_tensor(high)
-
-            transforms.insert(0, RescaleFromTanh(low, high))
-
-        super().__init__(base_dist, transforms)
-
-    def mode(self):
-        # Mode is mean of base distribution, passed through transforms
-
-        x = self.base_dist.mean
-
-        for transform in self.transforms:
-            x = transform(x)
-
-        return x
-
-    def stddev(self):
-        std = self.base_dist.stddev
-
-        x = std
-
-        for transform in self.transforms:
-            x = transform(x)
-
-        return x
+        return NotImplementedError("Not implemented")
