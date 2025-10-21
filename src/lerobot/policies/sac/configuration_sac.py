@@ -79,6 +79,7 @@ class PolicyConfig:
 
 
 @PreTrainedConfig.register_subclass("sac")
+@PreTrainedConfig.register_subclass("sac_flowrl")
 @dataclass
 class SACConfig(PreTrainedConfig):
     """Soft Actor-Critic (SAC) configuration.
@@ -201,6 +202,12 @@ class SACConfig(PreTrainedConfig):
 
     # Buffer
     n_steps: int = 1 # n-step returns
+
+    # FlowRL parameters
+    flow_rl_enabled: bool = False
+    flowrl_expectile_tau: float = 0.9 # expectile regression for V*: stop-grad on Q* (Eq. 18)
+    flow_rl_bc_weight: float = 0.1 # weighted BC (exploitation)
+    flow_rl_qv_weight: float = 1.0 # critic loss = ori_critic_loss + flow_rl_qv_weight * (v_loss + q_loss_star)
 
     def __post_init__(self):
         super().__post_init__()

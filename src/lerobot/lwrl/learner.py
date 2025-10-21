@@ -66,7 +66,8 @@ from lerobot.configs.train import TrainRLServerPipelineConfig
 from lerobot.datasets.factory import make_dataset
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.policies.factory import make_policy
-from lerobot.policies.sac.modeling_sac import SACPolicy
+from lerobot.policies.sac.modeling_sac import SACPolicy # as CurrentPolicy
+from lerobot.policies.sac.modeling_flowrl import SACFlowRLPolicy as CurrentPolicy
 from lerobot.rl.buffer import ReplayBuffer, concatenate_batch_transitions
 from lerobot.rl.process import ProcessSignalHandler
 from lerobot.rl.wandb_utils import WandBLogger
@@ -307,7 +308,7 @@ def add_actor_information_and_train(
 
     logging.info("Initializing policy")
 
-    policy: SACPolicy = make_policy(
+    policy: CurrentPolicy = make_policy(
         cfg=cfg.policy,
         env_cfg=cfg.env,
     )
@@ -1052,7 +1053,7 @@ def initialize_offline_replay_buffer(
 
 
 def get_observation_features(
-    policy: SACPolicy, observations: torch.Tensor, next_observations: torch.Tensor
+    policy: CurrentPolicy, observations: torch.Tensor, next_observations: torch.Tensor
 ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     """
     Get observation features from the policy encoder. It act as cache for the observation features.

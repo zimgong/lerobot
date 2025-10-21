@@ -1,6 +1,6 @@
 {    
     "output_dir": null,
-    "job_name": "lwlab_lerobot_pickup_100env_nsteps3_280episodes",
+    "job_name": "lwlab_lerobot_pickup_100env_nsteps3_280episodes_flowrl",
     "resume": false,
     "resume_from_output_dir": "/home/johndoe/Documents/lerobot-hilserl/outputs/train/2025-10-05/00-57-03_lwlab_lerobot_pickup_100env_nsteps3/",
     "seed": 1000,
@@ -22,7 +22,7 @@
         "use_imagenet_stats": false
     },
     "policy": {
-        "type": "sac",
+        "type": "sac_flowrl",
         "n_obs_steps": 1,
         "repo_id": "hf_username/policy_name",
         "normalization_mapping": {
@@ -31,6 +31,10 @@
             "ENV": "MIN_MAX",
             "ACTION": "MIN_MAX"
         },
+        "flow_rl_enabled": true,
+        "flowrl_expectile_tau": 0.9,
+        "flow_rl_bc_weight": 0.1,
+        "flow_rl_qv_weight": 1.0,
         "input_features": {
             "observation.images.image_global": {
                 "type": "VISUAL",

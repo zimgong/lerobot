@@ -101,6 +101,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 
         return SmolVLAPolicy
+    elif name == "sac_flowrl":
+        from lerobot.policies.sac.modeling_flowrl import SACFlowRLPolicy
+
+        return SACFlowRLPolicy
     else:
         raise NotImplementedError(f"Policy with name {name} is not implemented.")
 
@@ -137,6 +141,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
     elif policy_type == "pi05":
         return PI05Config(**kwargs)
     elif policy_type == "sac":
+        return SACConfig(**kwargs)
+    elif policy_type == "sac_flowrl":
         return SACConfig(**kwargs)
     elif policy_type == "smolvla":
         return SmolVLAConfig(**kwargs)
