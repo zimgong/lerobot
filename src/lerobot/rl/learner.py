@@ -1002,6 +1002,7 @@ def initialize_offline_replay_buffer(
             root=dataset_offline_path,
         )
 
+    offline_dataset.video_backend = "pyav"
     logging.info("Convert to a offline replay buffer")
     offline_replay_buffer = ReplayBuffer.from_lerobot_dataset(
         offline_dataset,

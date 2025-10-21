@@ -22,6 +22,12 @@ from lerobot.configs.types import NormalizationMode
 from lerobot.optim.optimizers import MultiAdamConfig
 from lerobot.utils.constants import ACTION, OBS_IMAGE, OBS_STATE
 
+from go1.configs.go1_base_cfg import BaseModelArguments
+from go1.tools.env_parse import get_bool_env
+
+
+DEBUG_MODE = get_bool_env("DEBUG_MODE")
+
 
 def is_image_feature(key: str) -> bool:
     """Check if a feature key represents an image feature.
@@ -45,6 +51,16 @@ class ConcurrencyConfig:
 
     actor: str = "threads"
     learner: str = "threads"
+
+
+@dataclass
+class GO1ModelArguments(BaseModelArguments):
+    model_name_or_path: str = field(default="agibot-world/GO-1-Air")
+    freeze_llm: bool = field(default=False if not DEBUG_MODE else True)
+    freeze_backbone: bool = field(default=False if not DEBUG_MODE else True)
+    freeze_mlp: bool = field(default=False if not DEBUG_MODE else True)
+    action_chunk_size: int = field(default=15)
+    latent_planning: bool = field(default=False)    
 
 
 @dataclass
@@ -76,9 +92,9 @@ class PolicyConfig:
     init_final: float = 0.05
 
 
-@PreTrainedConfig.register_subclass("sac")
+@PreTrainedConfig.register_subclass("sac_go1")
 @dataclass
-class SACConfig(PreTrainedConfig):
+class SACGO1Config(PreTrainedConfig):
     """Soft Actor-Critic (SAC) configuration.
 
     SAC is an off-policy actor-critic deep RL algorithm based on the maximum entropy
@@ -118,6 +134,20 @@ class SACConfig(PreTrainedConfig):
         }
     )
 
+    # obs/action space configuration
+    space_repack: dict = field(
+        default_factory=lambda: {
+            "state": "state",
+            "action": "action",
+            "cam_head_color": "cam_head_color",
+            "cam_hand_left_color": "cam_hand_left_color",
+            "cam_hand_right_color": "cam_hand_right_color",
+            "final_prompt": "final_prompt",
+        }
+    )
+    ctrl_freq: int = field(default=30)
+    default_prompt: str = field(default="your instruction here")
+
     # Architecture specifics
     # Device to run the model on (e.g., "cuda", "cpu")
     device: str = "cpu"
@@ -127,8 +157,6 @@ class SACConfig(PreTrainedConfig):
     vision_encoder_name: str | None = None
     # Whether to freeze the vision encoder during training
     freeze_vision_encoder: bool = True
-    # Hidden dimension size for the image encoder
-    image_encoder_hidden_dim: int = 32
     # Whether to use a shared encoder for actor and critic
     shared_encoder: bool = True
     # Number of discrete actions, eg for gripper actions
@@ -181,6 +209,8 @@ class SACConfig(PreTrainedConfig):
     grad_clip_norm: float = 40.0
 
     # Network configuration
+    # Configuration for the GO-1 model
+    go1_model_kwargs: GO1ModelArguments = field(default_factory=GO1ModelArguments)
     # Configuration for the critic network architecture
     critic_network_kwargs: CriticNetworkConfig = field(default_factory=CriticNetworkConfig)
     # Configuration for the actor network architecture
