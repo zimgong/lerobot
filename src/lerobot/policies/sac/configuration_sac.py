@@ -208,6 +208,12 @@ class SACConfig(PreTrainedConfig):
     flowrl_expectile_tau: float = 0.9 # expectile regression for V*: stop-grad on Q* (Eq. 18)
     flow_rl_bc_weight: float = 0.1 # weighted BC (exploitation)
     flow_rl_qv_weight: float = 1.0 # critic loss = ori_critic_loss + flow_rl_qv_weight * (v_loss + q_loss_star)
+    
+    # FlowRL gradient projection parameters
+    flowrl_gradproj_enabled: bool = False # enable gradient projection for actor loss
+    flowrl_gradproj_mode: str = "bc_on_rl_orth" # projection mode: "bc_on_rl_orth" or "mutual"
+    flowrl_gradproj_conflict_cos_thresh: float = 0.0 # cosine threshold for conflict detection
+    flowrl_gradproj_eps: float = 1e-12 # numerical stability epsilon
 
     def __post_init__(self):
         super().__post_init__()

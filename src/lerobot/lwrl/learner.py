@@ -544,6 +544,10 @@ def add_actor_information_and_train(
                 # Add actor info to training info
                 training_infos["loss_actor"] = loss_actor.item()
                 training_infos["actor_grad_norm"] = actor_grad_norm
+                
+                # optional projection diagnostics if available
+                if hasattr(policy, "_actor_proj_stats"):
+                    training_infos.update(policy._actor_proj_stats)
 
                 # Temperature optimization
                 temperature_output = policy.forward(forward_batch, model="temperature")

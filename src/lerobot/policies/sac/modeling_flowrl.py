@@ -453,39 +453,87 @@ class SACFlowRLPolicy(
         observation_features: Tensor | None = None,
         actions_buffer: Tensor | None = None,
     ) -> Tensor:
+        # ----- RL term (standard SAC actor loss) -----
         actions_pi, log_probs, _ = self.actor(observations, observation_features)
-
-        q_preds, q_preds_mean, q_preds_std = self.critic_forward(
+        q_preds, _, _ = self.critic_forward(
             observations=observations,
             actions=actions_pi,
             use_target=False,
             observation_features=observation_features,
         )
-        min_q_preds = q_preds.min(dim=0)[0]
+        min_q_preds = q_preds.min(dim=0)[0]  # [B]
+        L_rl = ((self.temperature * log_probs) - min_q_preds).mean()
 
-        actor_loss = ((self.temperature * log_probs) - min_q_preds).mean()
-
-        # ---- FlowRL: weighted BC (exploitation) ----
-        if self.flow_rl_enabled and actions_buffer is not None:
-            # Continuous part only if hybrid action space
+        # ----- FlowRL weighted BC term -----
+        lambda_bc = float(getattr(self.config, "flow_rl_bc_weight", 0.1))
+        L_bc = None
+        if self.flow_rl_enabled and (actions_buffer is not None):
             actions_buf_cont = (
                 actions_buffer if self.config.num_discrete_actions is None
                 else actions_buffer[:, :DISCRETE_DIMENSION_INDEX]
             )
-            # Plain BC mse per-sample (no flow matching here)
             bc_per_sample = self.actor.calc_bc_loss(actions_pi, actions_buf_cont)  # [B]
-
-            # Weight: ReLU( Q^{pi_beta*}(s,a_buf) - Q^{pi_theta}(s,a_pi) )  (Eq. 13–14)
             with torch.no_grad():
                 q_star_sa = self._q_beta_star_forward(observations, actions_buf_cont, observation_features)  # [B]
-            q_pi_sa = min_q_preds.detach()  # [B] current policy value on a_pi
+            q_pi_sa = min_q_preds.detach()  # [B]
             weights = torch.relu(q_star_sa - q_pi_sa)  # [B]
+            L_bc = (weights * bc_per_sample).mean()
+        else:
+            L_bc = torch.zeros_like(L_rl)
 
-            weighted_bc = (weights * bc_per_sample).mean()
-            lambda_bc = float(getattr(self.config, "flow_rl_bc_weight", 0.1))
-            actor_loss = actor_loss + lambda_bc * weighted_bc
+        # ----- If gradient projection is disabled, return the plain sum -----
+        if not bool(getattr(self.config, "flowrl_gradproj_enabled", False)):
+            return L_rl + lambda_bc * L_bc
 
-        return actor_loss
+        # ----- Gradient projection (actor only) -----
+        params = self._actor_trainable_params()
+        # grads of each part w.r.t actor params (no .backward() here)
+        g_rl = torch.autograd.grad(L_rl, params, retain_graph=True, create_graph=False, allow_unused=True)
+        g_bc = torch.autograd.grad(lambda_bc * L_bc, params, retain_graph=True, create_graph=False, allow_unused=True)
+
+        # stats
+        eps = float(getattr(self.config, "flowrl_gradproj_eps", 1e-12))
+        dot = self._dot(g_rl, g_bc)
+        nrl = torch.sqrt(self._norm2(g_rl) + eps)
+        nbc = torch.sqrt(self._norm2(g_bc) + eps)
+        cos = (dot / (nrl * nbc + eps)).clamp(-1.0, 1.0)
+
+        mode = str(getattr(self.config, "flowrl_gradproj_mode", "bc_on_rl_orth"))
+        thr = float(getattr(self.config, "flowrl_gradproj_conflict_cos_thresh", 0.0))
+        conflict = (cos < thr)
+
+        if mode == "mutual":
+            # project each onto the other's orthogonal complement when in conflict
+            if conflict:
+                # project rl on bc
+                coeff_rl = (self._dot(g_rl, g_bc) / (self._norm2(g_bc) + eps))
+                g_rl = self._sub(g_rl, self._scale(g_bc, coeff_rl))
+                # recompute stats for second projection
+                coeff_bc = (self._dot(g_bc, g_rl) / (self._norm2(g_rl) + eps))
+                g_bc = self._sub(g_bc, self._scale(g_rl, coeff_bc))
+            g_final = self._add(g_rl, g_bc)
+        else:
+            # default: project BC against RL
+            if conflict:
+                coeff = (dot / (self._norm2(g_rl) + eps))
+                g_bc = self._sub(g_bc, self._scale(g_rl, coeff))
+            g_final = self._add(g_rl, g_bc)
+
+        # build surrogate loss whose gradient equals g_final
+        L_surg = self._surrogate_loss_from_grads(params, g_final)
+        if L_surg.isnan():
+            raise ValueError("Surrogate loss is NaN")
+        # keep logging value equal to unprojected sum
+        L_sum = L_rl + lambda_bc * L_bc
+        
+        # wrap stats for optional logging (kept local to avoid interface churn)
+        self._actor_proj_stats = {
+            "actor_proj/cos": cos.detach().mean().item(),
+            "actor_proj/conflict_frac": conflict.float().detach().mean().item() if conflict.ndim else float(conflict),
+            "actor_proj/mode": 0 if mode=="bc_on_rl_orth" else 1,
+        }
+        
+        return L_surg + (L_sum - L_surg).detach()
 
     def _init_encoders(self):
         """Initialize shared or separate encoders for actor and critic."""
@@ -606,6 +654,78 @@ class SACFlowRLPolicy(
         """Elementwise expectile loss |tau - 1(x<0)| * x^2 ."""
         w = torch.abs(x.new_tensor(tau) - (x < 0).float())
         return w * x.pow(2)
+
+    # ---------- gradient surgery helpers (actor only) ----------
+    def _actor_trainable_params(self):
+        """Get actor parameters that are trainable (matching optimizer selection)."""
+        return [p for n, p in self.actor.named_parameters()
+                if p.requires_grad and (not self.shared_encoder or not n.startswith("encoder"))]
+
+    @staticmethod
+    def _dot(gs1, gs2):
+        """Compute dot product between two gradient lists."""
+        s = None
+        for g1, g2 in zip(gs1, gs2):
+            if (g1 is None) or (g2 is None): 
+                continue
+            v = (g1 * g2).sum()
+            s = v if s is None else (s + v)
+        return torch.zeros((), device=gs1[0].device) if s is None else s
+
+    @staticmethod
+    def _norm2(gs):
+        """Compute squared norm of gradient list."""
+        s = None
+        for g in gs:
+            if g is None:
+                continue
+            v = (g * g).sum()
+            s = v if s is None else (s + v)
+        return torch.zeros((), device=gs[0].device) if s is None else s
+
+    @staticmethod
+    def _scale(gs, c):
+        """Scale gradient list by scalar."""
+        return [None if g is None else g * c for g in gs]
+
+    @staticmethod
+    def _sub(gs_a, gs_b):
+        """Subtract gradient list b from gradient list a."""
+        out = []
+        for a, b in zip(gs_a, gs_b):
+            if a is None and b is None:
+                out.append(None)
+            elif a is None:
+                out.append(None - b)
+            elif b is None:
+                out.append(a)
+            else:
+                out.append(a - b)
+        return out
+
+    @staticmethod
+    def _add(gs_a, gs_b):
+        """Add gradient list b to gradient list a."""
+        out = []
+        for a, b in zip(gs_a, gs_b):
+            if a is None and b is None:
+                out.append(None)
+            elif a is None:
+                out.append(b)
+            elif b is None:
+                out.append(a)
+            else:
+                out.append(a + b)
+        return out
+
+    def _surrogate_loss_from_grads(self, params, grads):
+        """Build surrogate loss whose gradient equals the provided gradients."""
+        # grads must be detached
+        loss = torch.zeros((), device=params[0].device)
+        for p, g in zip(params, grads):
+            if g is not None:
+                loss = loss + (p * g.detach()).sum()
+        return loss
 
 
 class SACObservationEncoder(nn.Module):
