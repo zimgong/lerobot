@@ -23,7 +23,7 @@ from tqdm import tqdm
 from lwlab.distributed.proxy import RemoteEnv
 from lwlab.utils.config_loader import config_loader
 from policy.maniskill_ppo.agent import PPOArgs, PPO
-from policy.maniskill_ppo.agent import observation as prcoess_maniskill_ppo_observation
+from policy.maniskill_ppo.agent import observation as process_maniskill_ppo_observation
 from lerobot.lwrl.buffer_batched import ParallelReplayBuffer, BatchTransition
 from lerobot.utils.transition import move_transition_to_device
 
@@ -38,6 +38,15 @@ from lerobot.configs.train import TrainRLServerPipelineConfig
 from lerobot.processor import TransitionKey
 from lerobot.configs import parser
 
+def process_maniskill_ppo_observation_override(obs):
+    """
+    Override process maniskill ppo observation
+    Args:
+        obs: dict
+    """
+    # pop "hand camera" image
+    obs.pop("image_hand") if "image_hand" in obs else None
+    return process_maniskill_ppo_observation(obs)
 
 def save_image_uint8(image_tensor, filepath):
     """
@@ -132,7 +141,7 @@ class DataCollector:
         
         self.agent = PPO(
             self.env, 
-            prcoess_maniskill_ppo_observation(copy.deepcopy(
+            process_maniskill_ppo_observation_override(copy.deepcopy(
                 obs['policy'] if 'policy' in obs else obs)), 
             self.args.ppo, 
             self.args.device, 
@@ -187,7 +196,7 @@ class DataCollector:
             while step_count < self.args.num_steps:
                 # Get actions
                 actions = self.agent.agent.get_action(
-                    prcoess_maniskill_ppo_observation(copy.deepcopy(
+                    process_maniskill_ppo_observation_override(copy.deepcopy(
                         raw_obs['policy'] if 'policy' in raw_obs else raw_obs)), 
                     deterministic=self.args.deterministic
                 )
@@ -446,7 +455,7 @@ def parse_arguments():
 
     import datetime
     current_time = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
-    parser.add_argument("--root_dir", type=str, default=f"./datasets/{current_time}",
+    parser.add_argument("--root_dir", type=str, default=f"./data/{current_time}",
                        help="Dataset root directory")
     
     # hilserl args (for obs processing)

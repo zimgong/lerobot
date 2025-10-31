@@ -22,10 +22,55 @@ from tqdm import tqdm
 # 导入必要的模块
 from lwlab.distributed.proxy import RemoteEnv
 from lwlab.utils.config_loader import config_loader
-from policy.maniskill_ppo.agent import PPOArgs, PPO, observation
+from policy.maniskill_ppo.agent import PPOArgs, PPO
+from policy.maniskill_ppo.agent import observation as process_maniskill_ppo_observation
 from lerobot.lwrl.buffer_batched import ParallelReplayBuffer, BatchTransition
 from lerobot.utils.transition import move_transition_to_device
 
+def process_maniskill_ppo_observation_override(obs):
+    """
+    Override process maniskill ppo observation
+    Args:
+        obs: dict
+    """
+    # pop "hand camera" image
+    obs.pop("image_hand") if "image_hand" in obs else None
+    obs.pop("ee_pose") if "ee_pose" in obs else None
+    return process_maniskill_ppo_observation(obs)
+
+def _convert_images_to_uint8_chw(obs_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert image tensors in an observation dict to uint8 and CHW/ BCHW.
+
+    - Keeps keys unchanged
+    - Handles both 3D (H, W, C) and 4D (B, H, W, C) tensors
+    - Only transforms tensors that look like images (last dim 1 or 3)
+    """
+    if obs_dict is None:
+        return obs_dict
+
+    processed = {}
+    for key, value in obs_dict.items():
+        v = value
+        try:
+            if isinstance(v, torch.Tensor) and v.ndim in (3, 4):
+                if v.shape[-1] in (1, 3) and v[1:].numel() > 64**2:
+                    # Move channel-last to channel-first
+                    if v.ndim == 3:  # H, W, C -> C, H, W
+                        v = v.permute(2, 0, 1).contiguous()
+                    else:  # B, H, W, C -> B, C, H, W
+                        v = v.permute(0, 3, 1, 2).contiguous()
+                    # Cast to uint8 as requested
+                    if v.dtype != torch.uint8:
+                        v = v.to(torch.uint8)
+                    
+                    # uint8 to float32
+                    v = v.to(torch.float32)
+                    v /= 255.0
+        except Exception:
+            # If any unexpected structure, leave as-is
+            pass
+        processed[key] = v
+    return processed
 
 @dataclass
 class CollectionArgs:
@@ -49,7 +94,7 @@ class CollectionArgs:
     repo_id: str = "collected_dataset"
     task_name: str = "data_collection"
     fps: int = 20
-    root_dir: str = "./datasets"
+    root_dir: str = "./data"
     
     # PPO configuration
     ppo: PPOArgs = field(default_factory=PPOArgs)
@@ -78,12 +123,14 @@ class DataCollector:
     def setup_agent(self):
         """Setup agent"""
         print("Setting up agent...")
-        obs, _ = self.env.reset()
+        obs, infos = self.env.reset()
         obs = obs['policy']
+        if "ee_pose" in infos:
+            obs["ee_pose"] = infos["ee_pose"]
         
         self.agent = PPO(
             self.env, 
-            observation(copy.deepcopy(obs)), 
+            process_maniskill_ppo_observation_override(copy.deepcopy(obs)), 
             self.args.ppo, 
             self.args.device, 
             train=False
@@ -100,7 +147,7 @@ class DataCollector:
         """Setup buffer"""
         print("Setting up buffer...")
         self.buffer = ParallelReplayBuffer(
-            capacity=self.args.num_steps * 2,  # Extra capacity for safety
+            capacity=self.args.num_steps * self.env.num_envs * 2,  # Extra capacity for safety
             num_envs=self.env.num_envs,
             device=self.args.device,
             storage_device=self.args.storage_device
@@ -112,8 +159,10 @@ class DataCollector:
         print(f"Starting data collection: {self.args.num_steps} steps, {self.env.num_envs} parallel environments")
         
         # Reset environment
-        obs, _ = self.env.reset()
+        obs, infos = self.env.reset()
         obs = obs['policy']
+        if "ee_pose" in infos:
+            obs["ee_pose"] = infos["ee_pose"]
         
         step_count = 0
         success_count = 0
@@ -126,24 +175,31 @@ class DataCollector:
             while step_count < self.args.num_steps:
                 # Get actions
                 actions = self.agent.agent.get_action(
-                    observation(copy.deepcopy(obs)), 
+                    process_maniskill_ppo_observation_override(copy.deepcopy(obs)), 
                     deterministic=self.args.deterministic
                 )
                 
                 # Execute environment step
                 next_obs, rewards, terminations, truncations, infos = self.env.step(actions)
+                # add eef if in infos
+                if "ee_pose" in infos:
+                    next_obs["policy"]["ee_pose"] = infos["ee_pose"]
                 next_obs = next_obs['policy']
                 
                 # Statistics
                 success_count += infos['is_success'].sum().item()
                 episode_count += (terminations | truncations).sum().item()
                 
+                # Prepare copies for storage with image conversion (keys unchanged)
+                state_to_store = _convert_images_to_uint8_chw(copy.deepcopy(obs))
+                next_state_to_store = _convert_images_to_uint8_chw(copy.deepcopy(next_obs))
+
                 # Create transition data
                 parallel_transition = BatchTransition(
-                    state=obs,
+                    state=state_to_store,
                     action=actions,
                     reward=rewards,
-                    next_state=next_obs,
+                    next_state=next_state_to_store,
                     done=terminations,
                     truncated=truncations,
                     complementary_info={"is_success": infos['is_success'].to(torch.float32)},
@@ -264,7 +320,7 @@ def parse_arguments():
     
     # Environment configuration
     parser.add_argument("--task_config", type=str, 
-                       default="lerobot_liftobj_visual_hilserl_play",
+                       default="lerobot_liftobj_visual_hilserl_play", # read checkpoint from this config
                        help="Task configuration file")
     
     # Data collection configuration
@@ -285,7 +341,7 @@ def parse_arguments():
 
     import datetime
     current_time = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
-    parser.add_argument("--root_dir", type=str, default=f"./datasets/{current_time}",
+    parser.add_argument("--root_dir", type=str, default=f"./data/{current_time}",
                        help="Dataset root directory")
     
     return parser.parse_args()
