@@ -44,8 +44,16 @@
                 "type": "VISUAL",
                 "shape": [
                     3,
-                    128,
-                    128
+                    224,
+                    224
+                ]
+            },
+            "observation.images.image_hand": {
+                "type": "VISUAL",
+                "shape": [
+                    3,
+                    224,
+                    224
                 ]
             },
             "observation.state": {
@@ -73,6 +81,18 @@
         "use_amp": false,
         "dataset_stats": {
             "observation.images.image_global": {
+                "mean": [
+                    0.485,
+                    0.456,
+                    0.406
+                ],
+                "std": [
+                    0.229,
+                    0.169,
+                    0.166
+                ]
+            },
+            "observation.images.image_hand": {
                 "mean": [
                     0.485,
                     0.456,
@@ -340,8 +360,16 @@
                 "type": "VISUAL",
                 "shape": [
                     3,
-                    128,
-                    128
+                    224,
+                    224
+                ]
+            },
+            "observation.images.image_hand": {
+                "type": "VISUAL",
+                "shape": [
+                    3,
+                    224,
+                    224
                 ]
             },
             "observation.state": {
@@ -359,6 +387,7 @@
         },
         "features_map": {
             "observation.images.image_global": "observation.images.image_global",
+            "observation.images.image_hand": "observation.images.image_hand",
             "observation.state": "observation.state",
             "action": "action"
         }
