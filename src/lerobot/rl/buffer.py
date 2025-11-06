@@ -87,6 +87,7 @@ class ReplayBuffer:
         use_drq: bool = True,
         storage_device: str = "cpu",
         optimize_memory: bool = False,
+        preprocessor: None = None,
     ):
         """
         Replay buffer for storing transitions.
@@ -115,6 +116,7 @@ class ReplayBuffer:
         self.size = 0
         self.initialized = False
         self.optimize_memory = optimize_memory
+        self.preprocessor = preprocessor
 
         # Track episode boundaries for memory optimization
         self.episode_ends = torch.zeros(capacity, dtype=torch.bool, device=storage_device)
@@ -357,6 +359,9 @@ class ReplayBuffer:
             while not shutdown_event.is_set():
                 try:
                     batch = self.sample(batch_size)
+                    if self.preprocessor is not None:
+                        batch['state'] = self.preprocessor(batch['state'])
+                        batch['next_state'] = self.preprocessor(batch['next_state'])
                     # The timeout ensures the thread unblocks if the queue is full
                     # and the shutdown event gets set meanwhile.
                     data_queue.put(batch, block=True, timeout=0.5)

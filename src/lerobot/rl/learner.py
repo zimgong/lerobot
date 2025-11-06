@@ -311,6 +311,8 @@ def add_actor_information_and_train(
         env_cfg=cfg.env,
     )
 
+    observation_preprocessor = getattr(policy, "observation_preprocessor", None)
+
     assert isinstance(policy, nn.Module)
 
     policy.train()
@@ -326,7 +328,7 @@ def add_actor_information_and_train(
 
     log_training_info(cfg=cfg, policy=policy)
 
-    replay_buffer = initialize_replay_buffer(cfg, device, storage_device)
+    replay_buffer = initialize_replay_buffer(cfg, device, storage_device, observation_preprocessor)
     batch_size = cfg.batch_size
     offline_replay_buffer = None
 
@@ -335,6 +337,7 @@ def add_actor_information_and_train(
             cfg=cfg,
             device=device,
             storage_device=storage_device,
+            preprocessor=observation_preprocessor,
         )
         batch_size: int = batch_size // 2  # We will sample from both replay buffer
 
@@ -933,7 +936,7 @@ def log_training_info(cfg: TrainRLServerPipelineConfig, policy: nn.Module) -> No
 
 
 def initialize_replay_buffer(
-    cfg: TrainRLServerPipelineConfig, device: str, storage_device: str
+    cfg: TrainRLServerPipelineConfig, device: str, storage_device: str, preprocessor: None
 ) -> ReplayBuffer:
     """
     Initialize a replay buffer, either empty or from a dataset if resuming.
@@ -953,6 +956,7 @@ def initialize_replay_buffer(
             state_keys=cfg.policy.input_features.keys(),
             storage_device=storage_device,
             optimize_memory=True,
+            preprocessor=preprocessor,
         )
 
     logging.info("Resume training load the online dataset")
@@ -979,6 +983,7 @@ def initialize_offline_replay_buffer(
     cfg: TrainRLServerPipelineConfig,
     device: str,
     storage_device: str,
+    preprocessor: None,
 ) -> ReplayBuffer:
     """
     Initialize an offline replay buffer from a dataset.
@@ -1012,6 +1017,7 @@ def initialize_offline_replay_buffer(
         optimize_memory=True,
         capacity=cfg.policy.offline_buffer_capacity,
     )
+    offline_replay_buffer.preprocessor = preprocessor
     return offline_replay_buffer
 
 

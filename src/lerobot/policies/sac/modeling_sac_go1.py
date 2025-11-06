@@ -17,6 +17,7 @@
 
 import logging
 import math
+from contextlib import nullcontext
 from collections.abc import Callable
 from dataclasses import asdict
 from typing import Literal
@@ -48,11 +49,9 @@ from go1.internvl.train.constants import (
     REF_END_TOKEN,
     REF_START_TOKEN,
 )
-from go1.internvl.train.dataset import build_transform
 from go1.internvl.train.go1_train import build_ae_config, build_noise_scheduler_config
-from go1.lerobot.dataset_lerobot import tensor_to_pil, WrappedLeRobotDataset
-from go1.lerobot.dataset_transforms import make_conversation
 from go1.tools.env_parse import get_bool_env
+from lerobot.rl.preprocessing.go1_features import GO1ObservationPreprocessor
 
 DISCRETE_DIMENSION_INDEX = -1  # Gripper is always the last dimension
 logger = logging.getLogger(__name__)
@@ -623,6 +622,10 @@ class SACGO1Policy(
         self.log_alpha = nn.Parameter(torch.tensor([math.log(temp_init)]))
         self.temperature = self.log_alpha.exp().item()
 
+    @property
+    def observation_preprocessor(self) -> GO1ObservationPreprocessor | None:
+        return getattr(self.encoder_actor, "preprocessor", None)
+
 
 class SACObservationEncoder(nn.Module):
     """Encode image and/or state vector observations.Encode VLM observations using last layer key-value pairs.
@@ -641,8 +644,21 @@ class SACObservationEncoder(nn.Module):
         self.config = config
         self.tokenizer = tokenizer
         self.vla_model = vla_model
-        self.head_dim = self.vla_model.language_model.config.hidden_size // self.vla_model.language_model.config.num_attention_heads
-        self.mlp_head = MLP(input_dim=2 * self.head_dim, hidden_dims=[4 * self.head_dim, 2 * self.head_dim], activate_final=True, final_activation=None)
+        self.head_dim = (
+            self.vla_model.language_model.config.hidden_size
+            // self.vla_model.language_model.config.num_attention_heads
+        )
+        self.mlp_head = MLP(
+            input_dim=2 * self.head_dim,
+            hidden_dims=[4 * self.head_dim, 2 * self.head_dim],
+            activate_final=True,
+            final_activation=None,
+        )
+        self.preprocessor = GO1ObservationPreprocessor(
+            config=self.config,
+            tokenizer=self.tokenizer,
+            vla_model=self.vla_model,
+        )
         self._compute_output_dim()
 
     def _compute_output_dim(self) -> None:
@@ -658,147 +674,38 @@ class SACObservationEncoder(nn.Module):
     ):
         if cache is None:
             cache = self.get_cached_image_features(obs, detach)
-        return cache
+        return self._encode_images(cache, detach)
 
     def get_cached_image_features(self, obs: dict[str, Tensor], detach: bool = False) -> dict[str, Tensor]:
-        """Extract and optionally cache image features from observations.
+        """Extract and optionally cache image features from observations."""
 
-        This function processes image observations through the vision encoder once and returns
-        the resulting features.
-        When the image encoder is shared between actor and critics AND frozen, these features can be safely cached and
-        reused across policy components (actor, critic, discrete_critic), avoiding redundant forward passes.
+        model_param = next(self.vla_model.parameters())
+        model_device = getattr(self.vla_model, "device", model_param.device)
+        model_dtype = getattr(self.vla_model, "dtype", model_param.dtype)
 
-        Performance impact:
-        - The vision encoder forward pass is typically the main computational bottleneck during training and inference
-        - Caching these features can provide 2-4x speedup in training and inference
+        pixel_values = obs["pixel_values"].to(dtype=model_dtype, device=model_device)
 
-        Usage patterns:
-        - Called in select_action()
-        - Called in learner.py's get_observation_features() to pre-compute features for all policy components
-        - Called internally by forward()
-
-        Args:
-            obs: Dictionary of observation tensors containing image keys
-
-        Returns:
-            Dictionary mapping image keys to their corresponding encoded features
-        """
-        B = next(iter(obs.values())).shape[0]
-        obs_features_cache = []
-        # TODO: Implement parallel processing for this loop
-        for b in range(B):
-            if "cam_head_color" in self.config.space_repack:
-                obs["cam_head_color"] = tensor_to_pil(
-                    obs[self.config.space_repack["cam_head_color"]][b].permute(1, 2, 0)
-                )
-            if "cam_hand_right_color" in self.config.space_repack:
-                obs["cam_hand_right_color"] = tensor_to_pil(
-                    obs[self.config.space_repack["cam_hand_right_color"]][b].permute(1, 2, 0)
-                )
-            if "cam_hand_left_color" in self.config.space_repack:
-                obs["cam_hand_left_color"] = tensor_to_pil(
-                    obs[self.config.space_repack["cam_hand_left_color"]][b].permute(1, 2, 0)
-                )
-            if "final_prompt" in self.config.space_repack:
-                obs["final_prompt"] = tensor_to_pil(
-                    obs[self.config.space_repack["final_prompt"]][b].permute(1, 2, 0)
-                )
-            else:
-                obs["final_prompt"] = self.config.default_prompt
-            obs["final_prompt"] = make_conversation(prompt=obs["final_prompt"])
-
-            transform = build_transform(
-                is_train=True,
-                input_size=self.vla_model.config.force_image_size,
-                pad2square=self.vla_model.config.pad2square,
-                normalize_type="imagenet"
+        context_manager = torch.inference_mode() if detach else nullcontext()
+        with context_manager:
+            vlm_outputs = self.vla_model.common_process(
+                pixel_values=pixel_values,
+                input_ids=obs["input_ids"],
+                attention_mask=obs["attention_mask"],
+                position_ids=obs["position_ids"],
+                image_flags=obs["image_flags"],
+                return_dict=None,
+                labels=obs["labels"],
             )
-            observation_features = WrappedLeRobotDataset.multi_image_get_item(
-                raw_target=obs,
-                img_transform=transform,
-                text_tokenizer=self.tokenizer,
-                num_image_token=self.vla_model.num_image_token,
-                use_thumbnail=self.vla_model.config.use_thumbnail,
-                min_dynamic_patch=self.vla_model.config.min_dynamic_patch,
-                max_dynamic_patch=self.vla_model.config.max_dynamic_patch,
-                image_size=self.vla_model.config.force_image_size,
-            )
+            vlm_outputs.attention_mask = obs["attention_mask"]
+            if detach:
+                vlm_outputs.attention_mask = vlm_outputs.attention_mask.detach()
+                if hasattr(vlm_outputs, "past_key_values"):
+                    vlm_outputs.past_key_values = tuple(
+                        (past_key_value[0].detach(), past_key_value[1].detach())
+                        for past_key_value in vlm_outputs.past_key_values
+                    )
 
-            if "cam_head_color" in obs:
-                obs.pop("cam_head_color")
-            if "cam_hand_right_color" in obs:
-                obs.pop("cam_hand_right_color")
-            if "cam_hand_left_color" in obs:
-                obs.pop("cam_hand_left_color")
-            if "final_prompt" in obs:
-                obs.pop("final_prompt")
-
-            obs_features_cache.append(observation_features)
-
-        if B > 1:
-            pixel_values = torch.cat([ft["pixel_values"] for ft in obs_features_cache], dim=0).to(dtype=self.vla_model.dtype, device=self.vla_model.device)
-            input_ids = torch.stack([ft["input_ids"] for ft in obs_features_cache], dim=0).to(device=self.vla_model.device)
-            attention_mask = torch.stack([ft["attention_mask"] for ft in obs_features_cache], dim=0).to(device=self.vla_model.device)
-            position_ids = torch.stack([ft["position_ids"] for ft in obs_features_cache], dim=0).to(device=self.vla_model.device)
-            image_flags = torch.cat([ft["image_flags"] for ft in obs_features_cache], dim=0).to(device=self.vla_model.device)
-            labels = torch.stack([ft["labels"] for ft in obs_features_cache], dim=0).to(device=self.vla_model.device)
-        else:
-            pixel_values = obs_features_cache[0]["pixel_values"].to(dtype=self.vla_model.dtype, device=self.vla_model.device)
-            input_ids = obs_features_cache[0]["input_ids"].unsqueeze(0).to(device=self.vla_model.device)
-            attention_mask = obs_features_cache[0]["attention_mask"].unsqueeze(0).to(device=self.vla_model.device)
-            position_ids = obs_features_cache[0]["position_ids"].unsqueeze(0).to(device=self.vla_model.device)
-            image_flags = obs_features_cache[0]["image_flags"].to(device=self.vla_model.device)
-            labels = obs_features_cache[0]["labels"].unsqueeze(0).to(device=self.vla_model.device)
-
-        vlm_outputs = self.vla_model.common_process(
-            pixel_values=pixel_values,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            image_flags=image_flags,
-            return_dict=None,
-            labels=labels,
-        )
-        vlm_outputs.attention_mask = attention_mask
-        if detach:
-            vlm_outputs.attention_mask = vlm_outputs.attention_mask.detach()
-            for past_key_value in vlm_outputs.past_key_values:
-                past_key_value = (past_key_value[0].detach(), past_key_value[1].detach())
-        
-        # Extract last layer key-value pairs
-        # past_key_values is a tuple of (key, value) pairs for each layer
-        last_layer_kv = vlm_outputs.past_key_values[-1]  # Get last layer
-        last_key, last_value = last_layer_kv  # Unpack key and value
-        
-        # Apply attention mask to avoid pooling over padding tokens
-        # attention_mask shape: (batch_size, seq_len)
-        if attention_mask is not None:
-            # Expand attention mask to match key/value dimensions
-            # Shape: (batch_size, 1, seq_len, 1) for broadcasting
-            mask_expanded = attention_mask.unsqueeze(1).unsqueeze(-1)
-            
-            # Apply mask and compute masked mean
-            masked_key = last_key * mask_expanded
-            masked_value = last_value * mask_expanded
-            
-            # Sum over sequence length and heads, then divide by number of valid tokens
-            valid_tokens = mask_expanded.sum(dim=(1, 2))  # (batch_size, 1)
-            pooled_key = masked_key.sum(dim=(1, 2)) / (valid_tokens + 1e-8)
-            pooled_value = masked_value.sum(dim=(1, 2)) / (valid_tokens + 1e-8)
-        else:
-            # Fallback to simple mean pooling if no attention mask
-            pooled_key = last_key.mean(dim=(1, 2))  # Average over heads and sequence length
-            pooled_value = last_value.mean(dim=(1, 2))  # Average over heads and sequence length
-        
-        # Concatenate key and value features
-        # Shape: (batch_size, 2 * head_dim)
-        kv_features = torch.cat([pooled_key, pooled_value], dim=-1)
-        
-        # Pass through MLP head to get final features
-        # Shape: (batch_size, 256)
-        vlm_features = self.mlp_head(kv_features)
-
-        return {"vlm_outputs": vlm_outputs, "vlm_features": vlm_features}
+        return {"vlm_outputs": vlm_outputs}
 
     def _encode_images(self, cache: dict[str, Tensor], detach: bool) -> Tensor:
         """Encode image features from cached observations.
@@ -815,7 +722,28 @@ class SACObservationEncoder(nn.Module):
         Returns:
             Tensor: The encoded image features.
         """
-        pass
+        vlm_outputs = cache['vlm_outputs']
+        attention_mask = vlm_outputs.attention_mask
+        last_layer_kv = vlm_outputs.past_key_values[-1]
+        last_key, last_value = last_layer_kv
+
+        if attention_mask is not None:
+            mask_expanded = attention_mask.unsqueeze(1).unsqueeze(-1)
+            masked_key = last_key * mask_expanded
+            masked_value = last_value * mask_expanded
+            valid_tokens = mask_expanded.sum(dim=(1, 2))
+            pooled_key = masked_key.sum(dim=(1, 2)) / (valid_tokens + 1e-8)
+            pooled_value = masked_value.sum(dim=(1, 2)) / (valid_tokens + 1e-8)
+        else:
+            pooled_key = last_key.mean(dim=(1, 2))
+            pooled_value = last_value.mean(dim=(1, 2))
+
+        kv_features = torch.cat([pooled_key, pooled_value], dim=-1)
+        vlm_features = self.mlp_head(kv_features)
+        if detach:
+            vlm_features = vlm_features.detach()
+
+        return {"vlm_outputs": vlm_outputs, "vlm_features": vlm_features}
 
     @property
     def output_dim(self) -> int:
