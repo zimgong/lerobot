@@ -101,6 +101,7 @@ from lerobot.utils.utils import (
 )
 
 from .learner_service import MAX_WORKERS, SHUTDOWN_TIMEOUT, LearnerService
+from .profiler import get_profiler
 
 
 @parser.wrap()
@@ -304,6 +305,11 @@ def add_actor_information_and_train(
         init_logging(log_file=log_file, display_pid=True)
         logging.info("Initialized logging for actor information and training process")
 
+    # Initialize performance profiler
+    profiler_log_dir = os.path.join(cfg.output_dir, "profiling")
+    profiler = get_profiler(log_frequency=50, log_dir=profiler_log_dir)
+    logging.info("Performance profiler initialized")
+
     logging.info("Initializing policy")
 
     policy: SACPolicy = make_policy(
@@ -362,14 +368,15 @@ def add_actor_information_and_train(
             break
 
         # Process all available transitions to the replay buffer, send by the actor server
-        process_transitions(
-            transition_queue=transition_queue,
-            replay_buffer=replay_buffer,
-            offline_replay_buffer=offline_replay_buffer,
-            device=device,
-            dataset_repo_id=dataset_repo_id,
-            shutdown_event=shutdown_event,
-        )
+        with profiler.time_learner_component("data_processing"):
+            process_transitions(
+                transition_queue=transition_queue,
+                replay_buffer=replay_buffer,
+                offline_replay_buffer=offline_replay_buffer,
+                device=device,
+                dataset_repo_id=dataset_repo_id,
+                shutdown_event=shutdown_event,
+            )
 
         # Process all available interaction messages sent by the actor server
         interaction_message = process_interaction_messages(
@@ -396,24 +403,26 @@ def add_actor_information_and_train(
         time_for_one_optimization_step = time.time()
         for _ in range(utd_ratio - 1):
             # Sample from the iterators
-            batch = next(online_iterator)
+            with profiler.time_learner_component("batch_sampling"):
+                batch = next(online_iterator)
 
-            if dataset_repo_id is not None:
-                batch_offline = next(offline_iterator)
-                batch = concatenate_batch_transitions(
-                    left_batch_transitions=batch, right_batch_transition=batch_offline
+                if dataset_repo_id is not None:
+                    batch_offline = next(offline_iterator)
+                    batch = concatenate_batch_transitions(
+                        left_batch_transitions=batch, right_batch_transition=batch_offline
+                    )
+
+                actions = batch[ACTION]
+                rewards = batch["reward"]
+                observations = batch["state"]
+                next_observations = batch["next_state"]
+                done = batch["done"]
+                check_nan_in_transition(observations=observations, actions=actions, next_state=next_observations)
+
+            with profiler.time_learner_component("observation_encoding"):
+                observation_features, next_observation_features = get_observation_features(
+                    policy=policy, observations=observations, next_observations=next_observations
                 )
-
-            actions = batch[ACTION]
-            rewards = batch["reward"]
-            observations = batch["state"]
-            next_observations = batch["next_state"]
-            done = batch["done"]
-            check_nan_in_transition(observations=observations, actions=actions, next_state=next_observations)
-
-            observation_features, next_observation_features = get_observation_features(
-                policy=policy, observations=observations, next_observations=next_observations
-            )
 
             # Create a batch dictionary with all required elements for the forward method
             forward_batch = {
@@ -428,51 +437,58 @@ def add_actor_information_and_train(
             }
 
             # Use the forward method for critic loss
-            critic_output = policy.forward(forward_batch, model="critic")
+            with profiler.time_learner_component("critic_forward"):
+                critic_output = policy.forward(forward_batch, model="critic")
 
             # Main critic optimization
-            loss_critic = critic_output["loss_critic"]
-            optimizers["critic"].zero_grad()
-            loss_critic.backward()
-            critic_grad_norm = torch.nn.utils.clip_grad_norm_(
-                parameters=policy.critic_ensemble.parameters(), max_norm=clip_grad_norm_value
-            )
-            optimizers["critic"].step()
+            with profiler.time_learner_component("critic_optimization"):
+                loss_critic = critic_output["loss_critic"]
+                optimizers["critic"].zero_grad()
+                loss_critic.backward()
+                critic_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    parameters=policy.critic_ensemble.parameters(), max_norm=clip_grad_norm_value
+                )
+                optimizers["critic"].step()
 
             # Discrete critic optimization (if available)
             if policy.config.num_discrete_actions is not None:
-                discrete_critic_output = policy.forward(forward_batch, model="discrete_critic")
-                loss_discrete_critic = discrete_critic_output["loss_discrete_critic"]
-                optimizers["discrete_critic"].zero_grad()
-                loss_discrete_critic.backward()
-                discrete_critic_grad_norm = torch.nn.utils.clip_grad_norm_(
-                    parameters=policy.discrete_critic.parameters(), max_norm=clip_grad_norm_value
-                )
-                optimizers["discrete_critic"].step()
+                with profiler.time_learner_component("critic_forward"):
+                    discrete_critic_output = policy.forward(forward_batch, model="discrete_critic")
+                with profiler.time_learner_component("critic_optimization"):
+                    loss_discrete_critic = discrete_critic_output["loss_discrete_critic"]
+                    optimizers["discrete_critic"].zero_grad()
+                    loss_discrete_critic.backward()
+                    discrete_critic_grad_norm = torch.nn.utils.clip_grad_norm_(
+                        parameters=policy.discrete_critic.parameters(), max_norm=clip_grad_norm_value
+                    )
+                    optimizers["discrete_critic"].step()
 
             # Update target networks (main and discrete)
-            policy.update_target_networks()
+            with profiler.time_learner_component("target_network_update"):
+                policy.update_target_networks()
 
         # Sample for the last update in the UTD ratio
-        batch = next(online_iterator)
+        with profiler.time_learner_component("batch_sampling"):
+            batch = next(online_iterator)
 
-        if dataset_repo_id is not None:
-            batch_offline = next(offline_iterator)
-            batch = concatenate_batch_transitions(
-                left_batch_transitions=batch, right_batch_transition=batch_offline
+            if dataset_repo_id is not None:
+                batch_offline = next(offline_iterator)
+                batch = concatenate_batch_transitions(
+                    left_batch_transitions=batch, right_batch_transition=batch_offline
+                )
+
+            actions = batch[ACTION]
+            rewards = batch["reward"]
+            observations = batch["state"]
+            next_observations = batch["next_state"]
+            done = batch["done"]
+
+            check_nan_in_transition(observations=observations, actions=actions, next_state=next_observations)
+
+        with profiler.time_learner_component("observation_encoding"):
+            observation_features, next_observation_features = get_observation_features(
+                policy=policy, observations=observations, next_observations=next_observations
             )
-
-        actions = batch[ACTION]
-        rewards = batch["reward"]
-        observations = batch["state"]
-        next_observations = batch["next_state"]
-        done = batch["done"]
-
-        check_nan_in_transition(observations=observations, actions=actions, next_state=next_observations)
-
-        observation_features, next_observation_features = get_observation_features(
-            policy=policy, observations=observations, next_observations=next_observations
-        )
 
         # Create a batch dictionary with all required elements for the forward method
         forward_batch = {
@@ -485,15 +501,17 @@ def add_actor_information_and_train(
             "next_observation_feature": next_observation_features,
         }
 
-        critic_output = policy.forward(forward_batch, model="critic")
+        with profiler.time_learner_component("critic_forward"):
+            critic_output = policy.forward(forward_batch, model="critic")
 
-        loss_critic = critic_output["loss_critic"]
-        optimizers["critic"].zero_grad()
-        loss_critic.backward()
-        critic_grad_norm = torch.nn.utils.clip_grad_norm_(
-            parameters=policy.critic_ensemble.parameters(), max_norm=clip_grad_norm_value
-        ).item()
-        optimizers["critic"].step()
+        with profiler.time_learner_component("critic_optimization"):
+            loss_critic = critic_output["loss_critic"]
+            optimizers["critic"].zero_grad()
+            loss_critic.backward()
+            critic_grad_norm = torch.nn.utils.clip_grad_norm_(
+                parameters=policy.critic_ensemble.parameters(), max_norm=clip_grad_norm_value
+            ).item()
+            optimizers["critic"].step()
 
         # Initialize training info dictionary
         training_infos = {
@@ -503,14 +521,16 @@ def add_actor_information_and_train(
 
         # Discrete critic optimization (if available)
         if policy.config.num_discrete_actions is not None:
-            discrete_critic_output = policy.forward(forward_batch, model="discrete_critic")
-            loss_discrete_critic = discrete_critic_output["loss_discrete_critic"]
-            optimizers["discrete_critic"].zero_grad()
-            loss_discrete_critic.backward()
-            discrete_critic_grad_norm = torch.nn.utils.clip_grad_norm_(
-                parameters=policy.discrete_critic.parameters(), max_norm=clip_grad_norm_value
-            ).item()
-            optimizers["discrete_critic"].step()
+            with profiler.time_learner_component("critic_forward"):
+                discrete_critic_output = policy.forward(forward_batch, model="discrete_critic")
+            with profiler.time_learner_component("critic_optimization"):
+                loss_discrete_critic = discrete_critic_output["loss_discrete_critic"]
+                optimizers["discrete_critic"].zero_grad()
+                loss_discrete_critic.backward()
+                discrete_critic_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    parameters=policy.discrete_critic.parameters(), max_norm=clip_grad_norm_value
+                ).item()
+                optimizers["discrete_critic"].step()
 
             # Add discrete critic info to training info
             training_infos["loss_discrete_critic"] = loss_discrete_critic.item()
@@ -520,28 +540,32 @@ def add_actor_information_and_train(
         if optimization_step % policy_update_freq == 0:
             for _ in range(policy_update_freq):
                 # Actor optimization
-                actor_output = policy.forward(forward_batch, model="actor")
-                loss_actor = actor_output["loss_actor"]
-                optimizers["actor"].zero_grad()
-                loss_actor.backward()
-                actor_grad_norm = torch.nn.utils.clip_grad_norm_(
-                    parameters=policy.actor.parameters(), max_norm=clip_grad_norm_value
-                ).item()
-                optimizers["actor"].step()
+                with profiler.time_learner_component("actor_forward"):
+                    actor_output = policy.forward(forward_batch, model="actor")
+                with profiler.time_learner_component("actor_optimization"):
+                    loss_actor = actor_output["loss_actor"]
+                    optimizers["actor"].zero_grad()
+                    loss_actor.backward()
+                    actor_grad_norm = torch.nn.utils.clip_grad_norm_(
+                        parameters=policy.actor.parameters(), max_norm=clip_grad_norm_value
+                    ).item()
+                    optimizers["actor"].step()
 
                 # Add actor info to training info
                 training_infos["loss_actor"] = loss_actor.item()
                 training_infos["actor_grad_norm"] = actor_grad_norm
 
                 # Temperature optimization
-                temperature_output = policy.forward(forward_batch, model="temperature")
-                loss_temperature = temperature_output["loss_temperature"]
-                optimizers["temperature"].zero_grad()
-                loss_temperature.backward()
-                temp_grad_norm = torch.nn.utils.clip_grad_norm_(
-                    parameters=[policy.log_alpha], max_norm=clip_grad_norm_value
-                ).item()
-                optimizers["temperature"].step()
+                with profiler.time_learner_component("temperature_forward"):
+                    temperature_output = policy.forward(forward_batch, model="temperature")
+                with profiler.time_learner_component("temperature_optimization"):
+                    loss_temperature = temperature_output["loss_temperature"]
+                    optimizers["temperature"].zero_grad()
+                    loss_temperature.backward()
+                    temp_grad_norm = torch.nn.utils.clip_grad_norm_(
+                        parameters=[policy.log_alpha], max_norm=clip_grad_norm_value
+                    ).item()
+                    optimizers["temperature"].step()
 
                 # Add temperature info to training info
                 training_infos["loss_temperature"] = loss_temperature.item()
@@ -553,11 +577,13 @@ def add_actor_information_and_train(
 
         # Push policy to actors if needed
         if time.time() - last_time_policy_pushed > policy_parameters_push_frequency:
-            push_actor_policy_to_queue(parameters_queue=parameters_queue, policy=policy)
+            with profiler.time_learner_component("policy_parameter_push"):
+                push_actor_policy_to_queue(parameters_queue=parameters_queue, policy=policy)
             last_time_policy_pushed = time.time()
 
         # Update target networks (main and discrete)
-        policy.update_target_networks()
+        with profiler.time_learner_component("target_network_update"):
+            policy.update_target_networks()
 
         # Log training metrics at specified intervals
         if optimization_step % log_freq == 0:
@@ -565,6 +591,9 @@ def add_actor_information_and_train(
             if offline_replay_buffer is not None:
                 training_infos["offline_replay_buffer_size"] = len(offline_replay_buffer)
             training_infos["Optimization step"] = optimization_step
+
+            # Log component performance summary
+            profiler.log_component_summary()
 
             # Log training metrics
             if wandb_logger:
@@ -593,6 +622,9 @@ def add_actor_information_and_train(
 
         # Save checkpoint at specified intervals
         if saving_checkpoint and (optimization_step % save_freq == 0 or optimization_step == online_steps):
+            # Save profiling report before checkpoint
+            profiler.save_component_report(f"profiling_report_step_{optimization_step}.json")
+            
             save_training_checkpoint(
                 cfg=cfg,
                 optimization_step=optimization_step,

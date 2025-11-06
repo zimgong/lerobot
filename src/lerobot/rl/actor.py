@@ -98,6 +98,7 @@ from .gym_manipulator import (
     make_robot_env,
     step_env_and_process_transition,
 )
+from .profiler import get_profiler
 
 # Main entry point
 
@@ -237,6 +238,11 @@ def act_with_policy(
         init_logging(log_file=log_file, display_pid=True)
         logging.info("Actor policy process logging initialized")
 
+    # Initialize performance profiler
+    profiler_log_dir = os.path.join(cfg.output_dir, "profiling")
+    profiler = get_profiler(log_frequency=100, log_dir=profiler_log_dir)
+    logging.info("Actor performance profiler initialized")
+
     logging.info("make_env online")
 
     # Only create virtual display if no monitor is available
@@ -304,8 +310,9 @@ def act_with_policy(
 
         # Time policy inference and check if it meets FPS requirement
         with policy_timer:
-            # Extract observation from transition for policy
-            action = policy.select_action(batch=observation)
+            with profiler.time_actor_component("policy_inference"):
+                # Extract observation from transition for policy
+                action = policy.select_action(batch=observation, profiler=profiler)
         policy_fps = policy_timer.fps_last
         if observation_preprocessor is not None:
             observation.pop("pixel_values")
@@ -318,20 +325,22 @@ def act_with_policy(
         log_policy_frequency_issue(policy_fps=policy_fps, cfg=cfg, interaction_step=interaction_step)
 
         # Use the new step function
-        new_transition = step_env_and_process_transition(
-            env=online_env,
-            transition=transition,
-            action=action,
-            env_processor=env_processor,
-            action_processor=action_processor,
-        )
+        with profiler.time_actor_component("environment_step"):
+            new_transition = step_env_and_process_transition(
+                env=online_env,
+                transition=transition,
+                action=action,
+                env_processor=env_processor,
+                action_processor=action_processor,
+            )
 
         # Extract values from processed transition
-        next_observation = {
-            k: v
-            for k, v in new_transition[TransitionKey.OBSERVATION].items()
-            if k in cfg.policy.input_features
-        }
+        with profiler.time_actor_component("observation_processing"):
+            next_observation = {
+                k: v
+                for k, v in new_transition[TransitionKey.OBSERVATION].items()
+                if k in cfg.policy.input_features
+            }
 
         # Teleop action is the action that was executed in the environment
         # It is either the action from the teleop device or the action from the policy
@@ -350,23 +359,24 @@ def act_with_policy(
             episode_intervention = True
             episode_intervention_steps += 1
 
-        complementary_info = {
-            "discrete_penalty": torch.tensor(
-                [new_transition[TransitionKey.COMPLEMENTARY_DATA].get("discrete_penalty", 0.0)]
-            ),
-        }
-        # Create transition for learner (convert to old format)
-        list_transition_to_send_to_learner.append(
-            Transition(
-                state=observation,
-                action=executed_action,
-                reward=reward,
-                next_state=next_observation,
-                done=done,
-                truncated=truncated,
-                complementary_info=complementary_info,
+        with profiler.time_actor_component("transition_creation"):
+            complementary_info = {
+                "discrete_penalty": torch.tensor(
+                    [new_transition[TransitionKey.COMPLEMENTARY_DATA].get("discrete_penalty", 0.0)]
+                ),
+            }
+            # Create transition for learner (convert to old format)
+            list_transition_to_send_to_learner.append(
+                Transition(
+                    state=observation,
+                    action=executed_action,
+                    reward=reward,
+                    next_state=next_observation,
+                    done=done,
+                    truncated=truncated,
+                    complementary_info=complementary_info,
+                )
             )
-        )
 
         # Update transition for next iteration
         transition = new_transition
@@ -374,17 +384,22 @@ def act_with_policy(
         if done or truncated:
             logging.info(f"[ACTOR] Global step {interaction_step}: Episode reward: {sum_reward_episode}")
 
-            update_policy_parameters(policy=policy, parameters_queue=parameters_queue, device=device)
+            with profiler.time_actor_component("parameter_loading"):
+                update_policy_parameters(policy=policy, parameters_queue=parameters_queue, device=device, profiler=profiler)
 
             if len(list_transition_to_send_to_learner) > 0:
-                push_transitions_to_transport_queue(
-                    transitions=list_transition_to_send_to_learner,
-                    transitions_queue=transitions_queue,
-                )
+                with profiler.time_actor_component("data_serialization"):
+                    push_transitions_to_transport_queue(
+                        transitions=list_transition_to_send_to_learner,
+                        transitions_queue=transitions_queue,
+                    )
                 list_transition_to_send_to_learner = []
 
             stats = get_frequency_stats(policy_timer)
             policy_timer.reset()
+            
+            # Log actor component performance summary
+            profiler.log_component_summary()
 
             # Calculate intervention rate
             intervention_rate = 0.0
@@ -421,7 +436,8 @@ def act_with_policy(
 
         if cfg.env.fps is not None:
             dt_time = time.perf_counter() - start_time
-            busy_wait(1 / cfg.env.fps - dt_time)
+            with profiler.time_actor_component("fps_wait"):
+                busy_wait(1 / cfg.env.fps - dt_time)
 
 
 #  Communication Functions - Group all gRPC/messaging functions
@@ -672,11 +688,15 @@ def interactions_stream(
 #  Policy functions
 
 
-def update_policy_parameters(policy: SACPolicy, parameters_queue: Queue, device):
+def update_policy_parameters(policy: SACPolicy, parameters_queue: Queue, device, profiler=None):
     bytes_state_dict = get_last_item_from_queue(parameters_queue, block=False)
     if bytes_state_dict is not None:
         logging.info("[ACTOR] Load new parameters from Learner.")
-        state_dicts = bytes_to_state_dict(bytes_state_dict)
+        if profiler is not None:
+            with profiler.time_actor_component("network_communication"):
+                state_dicts = bytes_to_state_dict(bytes_state_dict)
+        else:
+            state_dicts = bytes_to_state_dict(bytes_state_dict)
 
         # TODO: check encoder parameter synchronization possible issues:
         # 1. When shared_encoder=True, we're loading stale encoder params from actor's state_dict

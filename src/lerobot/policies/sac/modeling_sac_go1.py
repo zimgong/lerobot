@@ -57,6 +57,8 @@ DISCRETE_DIMENSION_INDEX = -1  # Gripper is always the last dimension
 logger = logging.getLogger(__name__)
 
 
+from lerobot.rl.profiler import get_profiler
+
 class SACGO1Policy(
     PreTrainedPolicy,
 ):
@@ -104,21 +106,22 @@ class SACGO1Policy(
         raise NotImplementedError("SACPolicy does not support action chunking. It returns single actions!")
 
     @torch.no_grad()
-    def select_action(self, batch: dict[str, Tensor]) -> Tensor:
+    def select_action(self, batch: dict[str, Tensor], profiler=None) -> Tensor:
         """Select action for inference/evaluation"""
 
         observations_features = None
         if self.shared_encoder:
-            observations_features = self.actor.encoder.get_cached_image_features(batch)
+            observations_features = self.actor.encoder.get_cached_image_features(batch, profiler)
 
-        actions, _, _ = self.actor(batch, observations_features)
+        with profiler.time_actor_component("actor_forward"):
+            actions, _, _ = self.actor(batch, observations_features)
 
-        if self.config.num_discrete_actions is not None:
-            discrete_action_value = self.discrete_critic(batch, observations_features)
-            discrete_action = torch.argmax(discrete_action_value, dim=-1, keepdim=True)
-            actions = torch.cat([actions[:,0,:], discrete_action], dim=-1)
+            if self.config.num_discrete_actions is not None:
+                discrete_action_value = self.discrete_critic(batch, observations_features)
+                discrete_action = torch.argmax(discrete_action_value, dim=-1, keepdim=True)
+                actions = torch.cat([actions[:,0,:], discrete_action], dim=-1)
 
-        return actions.squeeze(1)
+            return actions.squeeze(1)
 
     def critic_forward(
         self,
