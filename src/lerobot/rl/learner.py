@@ -385,12 +385,12 @@ def add_actor_information_and_train(
 
         if online_iterator is None:
             online_iterator = replay_buffer.get_iterator(
-                batch_size=batch_size, async_prefetch=async_prefetch, queue_size=2
+                batch_size=batch_size, async_prefetch=async_prefetch, queue_size=batch_size
             )
 
         if offline_replay_buffer is not None and offline_iterator is None:
             offline_iterator = offline_replay_buffer.get_iterator(
-                batch_size=batch_size, async_prefetch=async_prefetch, queue_size=2
+                batch_size=batch_size, async_prefetch=async_prefetch, queue_size=batch_size
             )
 
         time_for_one_optimization_step = time.time()
