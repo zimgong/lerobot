@@ -420,6 +420,59 @@ class OfflineIQLPolicy(PreTrainedPolicy):
         }
         return loss, info
 
+    def compute_loss_actor_ppo(
+        self,
+        batch: dict[str, Tensor | dict[str, Tensor]],
+    ) -> dict[str, Tensor]:
+        """Offline PPO-style loss with ratios to behavior policy, using IQL advantages.
+
+        Args:
+            batch: Dictionary containing:
+                - action: Action tensor
+                - state: Observations tensor dict
+                - observation_feature: Optional pre-computed observation features
+                - complementary_info: Must contain 'log_prob_beh' for behavior log-prob
+
+        Returns:
+            Dictionary with 'loss_actor_ppo' and 'ratio_mean' metrics
+        """
+        actions: Tensor = batch[ACTION]
+        observations: dict[str, Tensor] = batch["state"]
+        observation_features: Tensor | None = batch.get("observation_feature")
+        comp = batch.get("complementary_info") or {}
+
+        logp_beh: Tensor | None = comp.get("log_prob_beh") if isinstance(comp, dict) else None
+        if logp_beh is None:
+            raise ValueError("PPO-style update requires complementary_info['log_prob_beh']")
+
+        # Current log prob
+        dist, _ = self._actor_distribution(observations, observation_features)
+        logp = dist.log_prob(actions)
+
+        # Importance ratio
+        ratio = torch.exp(logp - logp_beh)
+
+        # IQL advantage (stop-grad)
+        with torch.no_grad():
+            q_values = self.critic_ensemble(observations, actions, observation_features)
+            q_min = q_values.min(dim=0)[0]
+            v_values = self.value_forward(
+                observations=observations,
+                observation_features=observation_features,
+                use_target=False,
+                detach_encoder=True,
+            )
+            adv = q_min - v_values
+            if self.config.normalize_advantage:
+                adv_std = adv.std(unbiased=False)
+                adv = (adv - adv.mean()) / (adv_std + 1e-8)
+
+        eps = getattr(self.config, "ppo_clip_eps", 0.2)
+        unclipped = ratio * adv
+        clipped = torch.clamp(ratio, 1.0 - eps, 1.0 + eps) * adv
+        loss = -torch.mean(torch.minimum(unclipped, clipped))
+        return {"loss_actor_ppo": loss, "ratio_mean": ratio.mean().detach()}
+
     # --------------------------------------------------------------------- #
     # Utilities
     # --------------------------------------------------------------------- #
@@ -545,5 +598,6 @@ class OfflineIQLPolicy(PreTrainedPolicy):
     def _ensure_actor_encoder_trainable(self) -> None:
         for param in self.actor.encoder.parameters():
             if not param.requires_grad:
-                print(f"BC Stage: Ensuring encoder {param.name()} is trainable")
+                # Enable grad for all encoder params during BC stage
+                print("BC Stage: enabling gradients for actor encoder parameters")
                 param.requires_grad_(True)

@@ -39,6 +39,11 @@ class OfflineIQLConfig(SACConfig):
     awr_clip_max: float | None = 100.0
     normalize_advantage: bool = True
 
+    # PPO offline (optional)
+    ppo_clip_eps: float = 0.2
+    # "awr" (default) or "ppo"
+    actor_update: str = "awr"
+
     # Optimizer hyperparameters
     value_lr: float = 3e-4
 

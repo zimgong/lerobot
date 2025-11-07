@@ -181,7 +181,21 @@ class TrainPipelineConfig(HubMixin):
             return draccus.parse(cls, config_file, args=cli_args)
 
 
+@dataclass
+class OfflineStageConfig:
+    """Configuration for iterative offline RL stage."""
+    iters: int = 10
+    iql_steps: int = 5000
+    bc_steps_after_merge: int = 2000
+    sync_critic_encoder_after_bc: bool = False # enforce sync critic encoder with actor encoder after BC finetuning
+    success_keep_ratio: float = 1.0
+    ope_threshold: float = 0.02
+    ope_min_episodes: int = 10
+    actor_sleep_sec: float = 0.0
+
+
 @dataclass(kw_only=True)
 class TrainRLServerPipelineConfig(TrainPipelineConfig):
     dataset: DatasetConfig | None = None  # NOTE: In RL, we don't need an offline dataset
     resume_from_output_dir: Path | None = None
+    offline: OfflineStageConfig = field(default_factory=OfflineStageConfig)

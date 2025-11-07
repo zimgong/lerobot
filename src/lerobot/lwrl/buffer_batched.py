@@ -139,7 +139,13 @@ class ParallelReplayBuffer:
 
         if image_augmentation_function is None:
             base_function = functools.partial(random_shift, pad=4)
-            self.image_augmentation_function = torch.compile(base_function)
+            # Skip torch.compile for MPS (Metal) backend due to shader compilation issues
+            # See: https://github.com/pytorch/pytorch/issues/150121
+            device_str = str(device).lower()
+            if "mps" in device_str:
+                self.image_augmentation_function = base_function
+            else:
+                self.image_augmentation_function = torch.compile(base_function)
         self.use_drq = use_drq
 
     def _initialize_storage(
