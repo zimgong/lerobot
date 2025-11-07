@@ -251,15 +251,21 @@ class ReplayBuffer:
 
         # First pass: load all state tensors to target device
         for key in self.states:
-            batch_state[key] = self.states[key][idx].to(self.device)
+            batch_state[key] = self.states[key][idx]
+            if key not in image_keys:
+                batch_state[key] = batch_state[key].to(self.device)
 
             if not self.optimize_memory:
                 # Standard approach - load next_states directly
-                batch_next_state[key] = self.next_states[key][idx].to(self.device)
+                batch_next_state[key] = self.next_states[key][idx]
+                if key not in image_keys:
+                    batch_next_state[key] = batch_next_state[key].to(self.device)
             else:
                 # Memory-optimized approach - get next_state from the next index
                 next_idx = (idx + 1) % self.capacity
-                batch_next_state[key] = self.states[key][next_idx].to(self.device)
+                batch_next_state[key] = self.states[key][next_idx]
+                if key not in image_keys:
+                    batch_next_state[key] = batch_next_state[key].to(self.device)
 
         # Apply image augmentation in a batched way if needed
         if self.use_drq and image_keys:

@@ -103,7 +103,7 @@ class GO1ObservationPreprocessor:
         for alias, source_key in self._camera_alias_to_source_key.items():
             if source_key not in observation:
                 continue
-            camera_tensor = observation[source_key][0].detach().cpu().permute(1, 2, 0)
+            camera_tensor = observation[source_key][0].permute(1, 2, 0)
             raw_target[alias] = tensor_to_pil(camera_tensor)
 
         if self._prompt_source_key and self._prompt_source_key in observation:

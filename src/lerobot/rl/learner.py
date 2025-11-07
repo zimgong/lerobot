@@ -385,12 +385,12 @@ def add_actor_information_and_train(
 
         if online_iterator is None:
             online_iterator = replay_buffer.get_iterator(
-                batch_size=batch_size, async_prefetch=async_prefetch, queue_size=batch_size
+                batch_size=batch_size, async_prefetch=async_prefetch, queue_size=16
             )
 
         if offline_replay_buffer is not None and offline_iterator is None:
             offline_iterator = offline_replay_buffer.get_iterator(
-                batch_size=batch_size, async_prefetch=async_prefetch, queue_size=batch_size
+                batch_size=batch_size, async_prefetch=async_prefetch, queue_size=16
             )
 
         time_for_one_optimization_step = time.time()
@@ -955,6 +955,7 @@ def initialize_replay_buffer(
             device=device,
             state_keys=cfg.policy.input_features.keys(),
             storage_device=storage_device,
+            use_drq=False,
             optimize_memory=True,
             preprocessor=preprocessor,
         )
@@ -973,6 +974,7 @@ def initialize_replay_buffer(
     return ReplayBuffer.from_lerobot_dataset(
         lerobot_dataset=dataset,
         capacity=cfg.policy.online_buffer_capacity,
+        use_drq=False,
         device=device,
         state_keys=cfg.policy.input_features.keys(),
         optimize_memory=True,
@@ -1013,6 +1015,7 @@ def initialize_offline_replay_buffer(
         offline_dataset,
         device=device,
         state_keys=cfg.policy.input_features.keys(),
+        use_drq=False,
         storage_device=storage_device,
         optimize_memory=True,
         capacity=cfg.policy.offline_buffer_capacity,
