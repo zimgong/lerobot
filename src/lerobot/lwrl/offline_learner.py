@@ -566,11 +566,12 @@ def add_actor_information_and_train(
         
         # --------- OPE gate at end of iteration ----------
         logging.info("[OFFLINE] Evaluating policy with OPE (AM-Q)...")
-        cand_score, cand_eps = amq_score_from_buffer(replay_buffer)
+        cand_score, cand_frames = amq_score_from_buffer(replay_buffer)
 
-        logging.info(f"[OFFLINE] OPE score: {cand_score:.2f}, episodes: {cand_eps}, threshold: {ope_threshold}")
+        logging.info(f"[OFFLINE] OPE score: {cand_score:.2f}, frames: {cand_frames}, threshold: {ope_threshold}")
 
-        if cand_eps >= ope_min_episodes and (cand_score - accepted_policy_score) > ope_threshold:
+        # Note: ope_min_episodes is now interpreted as minimum frames for acceptance gate
+        if cand_frames >= ope_min_episodes and (cand_score - accepted_policy_score) > ope_threshold:
             # Accept and refresh reference score
             logging.info(f"[OFFLINE] Policy accepted! Score improvement: {cand_score - accepted_policy_score:.2f}")
             accepted_policy_score = cand_score
@@ -579,7 +580,6 @@ def add_actor_information_and_train(
             # Merge offline dataset with SUCCESSFUL online episodes
             logging.info("[OFFLINE] Merging successful online episodes into offline buffer...")
 
-            # TODO: merge offline and online buffer and do BC training
             offline_replay_buffer = merge_offline_online_success(
                 offline_buffer=offline_replay_buffer,
                 online_buffer=replay_buffer,
@@ -592,9 +592,12 @@ def add_actor_information_and_train(
             if bc_steps_after_merge > 0:
                 logging.info(f"[OFFLINE] Running BC finetune for {bc_steps_after_merge} steps...")
                 # Unfreeze encoder for BC stage (full-model BC)
-                original_encoder_requires_grad = policy.actor.encoder.image_encoder.parameters()[0].requires_grad
-                for param in policy.actor.encoder.parameters():
-                    param.requires_grad_(True)
+                original_encoder_requires_grad = None
+                if hasattr(policy.actor.encoder, "image_encoder") and len(list(policy.actor.encoder.image_encoder.parameters())) > 0:
+                    original_encoder_requires_grad = next(policy.actor.encoder.image_encoder.parameters()).requires_grad
+                
+                # Ensure actor encoder is trainable
+                policy._ensure_actor_encoder_trainable()
 
                 for bc_step in range(bc_steps_after_merge):
                     bc_batch = next(offline_iterator)
@@ -624,27 +627,48 @@ def add_actor_information_and_train(
                             custom_step_key="Training step",
                         )
 
-                # Reset encoder requires_grad to original value
-                for param in policy.actor.encoder.image_encoder.parameters():
-                    param.requires_grad_(original_encoder_requires_grad)
+                # Reset encoder requires_grad to original value if it was set
+                if original_encoder_requires_grad is not None:
+                    for param in policy.actor.encoder.image_encoder.parameters():
+                        param.requires_grad_(original_encoder_requires_grad)
                 
                 # Optionally sync encoders if not shared
-                # TODO: check if this is needed
                 if cfg.offline.sync_critic_encoder_after_bc and not policy.shared_encoder:
                     logging.info("[OFFLINE] Syncing critic encoder with actor encoder after BC...")
                     policy.encoder_critic.load_state_dict(policy.actor.encoder.state_dict(), strict=False)
 
                 logging.info("[OFFLINE] BC finetune complete.")
 
-                # Sync parameters to actor server
-                push_actor_policy_to_queue(parameters_queue=parameters_queue, policy=policy)
+            # Update target networks after BC (critical for value/critic targets)
+            policy.update_target_networks()
+            logging.info("[OFFLINE] Target networks updated after BC.")
+
+            # Push parameters to actor server (atomic: before buffer reinit)
+            push_actor_policy_to_queue(parameters_queue=parameters_queue, policy=policy)
+            logging.info("[OFFLINE] Pushed updated policy parameters to actor.")
+
+            # Reinitialize online buffer (not just clear) to reset complementary_info layout
+            replay_buffer = initialize_replay_buffer(cfg, device, storage_device)
+            logging.info("[OFFLINE] Reinitialized online replay buffer.")
+
+            # Log acceptance metrics
+            if wandb_logger is not None:
+                wandb_logger.log_dict(
+                    {
+                        "ope_score": cand_score,
+                        "ope_frames": cand_frames,
+                        "accepted_policy_score": accepted_policy_score,
+                    },
+                    mode="train",
+                    custom_step_key="Optimization step",
+                )
 
         else:
             # Reject candidate; keep collecting more online episodes into online_buffer
             logging.info(
-                f"[OFFLINE] Policy rejected (insufficient improvement or episodes). "
+                f"[OFFLINE] Policy rejected (insufficient improvement or frames). "
                 f"Current: {cand_score:.2f}, Accepted: {accepted_policy_score:.2f}, "
-                f"Episodes: {cand_eps}/{ope_min_episodes}"
+                f"Frames: {cand_frames}"
             )
 
 

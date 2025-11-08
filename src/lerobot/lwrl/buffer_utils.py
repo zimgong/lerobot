@@ -67,7 +67,9 @@ def merge_offline_online_success(
     datasets_to_merge = []
     
     logging.info("Converting buffers to LeRobotDataset (filtering for successful episodes)...")
-    # Note: to_lerobot_dataset already filters for successful episodes
+    # Note: to_lerobot_dataset() filters for successful episodes by checking
+    # complementary_info.is_success == 1.0 in at least one frame per episode.
+    # Only episodes with at least one successful frame are included in the dataset.
     with tempfile.TemporaryDirectory() as tmpdir:
         # Convert offline buffer if not empty
         if len(offline_buffer) > 0:

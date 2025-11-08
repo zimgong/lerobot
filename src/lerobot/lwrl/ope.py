@@ -27,21 +27,22 @@ import torch
 from torch import Tensor
 
 from lerobot.rl.buffer import ReplayBuffer
+from lerobot.lwrl.buffer_batched import ParallelReplayBuffer
 
 
 @torch.no_grad()
-def amq_score_from_buffer(buf: ReplayBuffer, key: str = "q_min") -> tuple[float, int]:
+def amq_score_from_buffer(buf: ReplayBuffer | ParallelReplayBuffer, key: str = "q_min") -> tuple[float, int]:
     """Compute AM-Q score from buffer's complementary_info.
 
-    AM-Q (Average Model Q-value) is computed as the sum of Q-values along
-    policy-collected episodes, normalized by the number of episodes.
+    AM-Q (Average Model Q-value) is computed as the sum of Q-values across
+    all transitions, normalized by the number of frames (transitions).
 
     Args:
-        buf: ReplayBuffer containing transitions with complementary_info
+        buf: ReplayBuffer or ParallelReplayBuffer containing transitions with complementary_info
         key: Key in complementary_info containing Q-values (default: "q_min")
 
     Returns:
-        Tuple of (AM-Q score, number of episodes). Returns (-inf, 0) if no data.
+        Tuple of (AM-Q score, number of frames). Returns (-inf, 0) if no data.
     """
     if not hasattr(buf, "initialized") or not buf.initialized:
         return float("-inf"), 0
@@ -53,16 +54,12 @@ def amq_score_from_buffer(buf: ReplayBuffer, key: str = "q_min") -> tuple[float,
     if qvals is None or qvals.numel() == 0:
         return float("-inf"), 0
 
-    # Sum across all transitions; normalize by number of episodes for scale invariance
-    # If the actor logged 'episode_id', we can count distinct episodes
-    ep_ids = buf.complementary_info.get("episode_id", None)
-    if ep_ids is None:
-        eps = 1
-    else:
-        eps = int(torch.unique(ep_ids).numel())
-        eps = max(eps, 1)
+    # Get total number of frames (transitions) in the buffer
+    num_frames = len(buf)
+    if num_frames == 0:
+        return float("-inf"), 0
 
-    # AM-Q = sum of Q-values normalized by episodes
-    score = float(qvals.sum().item()) / eps
-    return score, eps
+    # AM-Q = sum of Q-values normalized by number of frames
+    score = float(qvals.sum().item()) / num_frames
+    return score, num_frames
 
