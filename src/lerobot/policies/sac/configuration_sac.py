@@ -149,6 +149,9 @@ class SACConfig(PreTrainedConfig):
     online_step_before_learning: int = 100
     # Frequency of policy updates
     policy_update_freq: int = 1
+    # Optimization step at which to start training the actor (critic-only training before this step)
+    # If None, actor training starts immediately. If set, only critic is trained until this step.
+    actor_training_start_step: int | None = None
 
     # SAC algorithm parameters
     # Discount factor for the SAC algorithm

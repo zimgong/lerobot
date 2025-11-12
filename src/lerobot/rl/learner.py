@@ -295,6 +295,7 @@ def add_actor_information_and_train(
     saving_checkpoint = cfg.save_checkpoint
     online_steps = cfg.policy.online_steps
     async_prefetch = cfg.policy.async_prefetch
+    actor_training_start_step = cfg.policy.actor_training_start_step
 
     # Initialize logging for multiprocessing
     if not use_threads(cfg):
@@ -327,6 +328,24 @@ def add_actor_information_and_train(
     resume_optimization_step, resume_interaction_step = load_training_state(cfg=cfg, optimizers=optimizers)
 
     log_training_info(cfg=cfg, policy=policy)
+
+    # Log actor training start step configuration
+    if actor_training_start_step is not None:
+        logging.info(
+            colored(
+                f"[LEARNER] Critic-only training enabled. Actor training will start at optimization step {actor_training_start_step}",
+                color="yellow",
+                attrs=["bold"],
+            )
+        )
+    else:
+        logging.info(
+            colored(
+                "[LEARNER] Actor and critic training enabled from the start",
+                color="green",
+                attrs=["bold"],
+            )
+        )
 
     replay_buffer = initialize_replay_buffer(cfg, device, storage_device, observation_preprocessor)
     batch_size = cfg.batch_size
@@ -517,7 +536,20 @@ def add_actor_information_and_train(
             training_infos["discrete_critic_grad_norm"] = discrete_critic_grad_norm
 
         # Actor and temperature optimization (at specified frequency)
-        if optimization_step % policy_update_freq == 0:
+        # Only train actor if actor_training_start_step is None or we've reached that step
+        should_train_actor = actor_training_start_step is None or optimization_step >= actor_training_start_step
+        
+        # Log when actor training starts
+        if should_train_actor and actor_training_start_step is not None and optimization_step == actor_training_start_step:
+            logging.info(
+                colored(
+                    f"[LEARNER] Actor training starting at optimization step {optimization_step}",
+                    color="green",
+                    attrs=["bold"],
+                )
+            )
+        
+        if should_train_actor and optimization_step % policy_update_freq == 0:
             for _ in range(policy_update_freq):
                 # Actor optimization
                 actor_output = policy.forward(forward_batch, model="actor")
@@ -740,26 +772,26 @@ def save_training_checkpoint(
 
     # TODO : temporary save replay buffer here, remove later when on the robot
     # We want to control this with the keyboard inputs
-    dataset_dir = os.path.join(cfg.output_dir, "dataset")
-    if os.path.exists(dataset_dir) and os.path.isdir(dataset_dir):
-        shutil.rmtree(dataset_dir)
+    # dataset_dir = os.path.join(cfg.output_dir, "dataset")
+    # if os.path.exists(dataset_dir) and os.path.isdir(dataset_dir):
+    #     shutil.rmtree(dataset_dir)
 
     # Save dataset
     # NOTE: Handle the case where the dataset repo id is not specified in the config
     # eg. RL training without demonstrations data
-    repo_id_buffer_save = cfg.env.task if dataset_repo_id is None else dataset_repo_id
-    replay_buffer.to_lerobot_dataset(repo_id=repo_id_buffer_save, fps=fps, root=dataset_dir)
+    # repo_id_buffer_save = cfg.env.task if dataset_repo_id is None else dataset_repo_id
+    # replay_buffer.to_lerobot_dataset(repo_id=repo_id_buffer_save, fps=fps, root=dataset_dir)
 
-    if offline_replay_buffer is not None:
-        dataset_offline_dir = os.path.join(cfg.output_dir, "dataset_offline")
-        if os.path.exists(dataset_offline_dir) and os.path.isdir(dataset_offline_dir):
-            shutil.rmtree(dataset_offline_dir)
+    # if offline_replay_buffer is not None:
+    #     dataset_offline_dir = os.path.join(cfg.output_dir, "dataset_offline")
+    #     if os.path.exists(dataset_offline_dir) and os.path.isdir(dataset_offline_dir):
+    #         shutil.rmtree(dataset_offline_dir)
 
-        offline_replay_buffer.to_lerobot_dataset(
-            cfg.dataset.repo_id,
-            fps=fps,
-            root=dataset_offline_dir,
-        )
+    #     offline_replay_buffer.to_lerobot_dataset(
+    #         cfg.dataset.repo_id,
+    #         fps=fps,
+    #         root=dataset_offline_dir,
+    #     )
 
     logging.info("Resume training")
 
