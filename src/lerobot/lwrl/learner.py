@@ -970,6 +970,9 @@ def initialize_replay_buffer(
         ReplayBuffer: Initialized replay buffer
     """
     # try to load (sometimes we don't save dataset to save space)
+    if not hasattr(cfg.env, "num_envs"):
+        cfg.env.num_envs = 1 # roll back to single environment
+    
     if cfg.resume:
         logging.info("Resume training load the online dataset")
         dataset_path = os.path.join(cfg.output_dir, "dataset")

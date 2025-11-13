@@ -191,7 +191,7 @@ class OfflineStageConfig:
     success_keep_ratio: float = 1.0
     ope_threshold: float = 0.02
     ope_min_episodes: int = 10
-    actor_sleep_sec: float = 0.0
+    pretrain_path: str | None = None
 
 
 @dataclass(kw_only=True)
