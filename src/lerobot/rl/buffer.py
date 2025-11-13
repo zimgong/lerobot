@@ -20,6 +20,7 @@ from contextlib import suppress
 from typing import TypedDict
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F  # noqa: N812
 from tqdm import tqdm
 
@@ -87,6 +88,8 @@ class ReplayBuffer:
         use_drq: bool = True,
         storage_device: str = "cpu",
         optimize_memory: bool = False,
+        preprocessor: None = None,
+        use_shared_memory: bool = False,
     ):
         """
         Replay buffer for storing transitions.
@@ -104,9 +107,15 @@ class ReplayBuffer:
                 Using "cpu" can help save GPU memory.
             optimize_memory (bool): If True, optimizes memory by not storing duplicate next_states when
                 they can be derived from states. This is useful for large datasets where next_state[i] = state[i+1].
+            preprocessor (Callable | None): A function that takes a batch of states and returns a batch of preprocessed states.
+            use_shared_memory (bool): If True, enables shared memory for multi-GPU training. All tensors
+                will be placed in shared memory so all processes can access them. Only works with storage_device="cpu".
         """
         if capacity <= 0:
             raise ValueError("Capacity must be greater than 0.")
+
+        if use_shared_memory and storage_device != "cpu":
+            raise ValueError("use_shared_memory=True requires storage_device='cpu'")
 
         self.capacity = capacity
         self.device = device
@@ -115,6 +124,8 @@ class ReplayBuffer:
         self.size = 0
         self.initialized = False
         self.optimize_memory = optimize_memory
+        self.preprocessor = preprocessor
+        self.use_shared_memory = use_shared_memory
 
         # Track episode boundaries for memory optimization
         self.episode_ends = torch.zeros(capacity, dtype=torch.bool, device=storage_device)
@@ -128,6 +139,36 @@ class ReplayBuffer:
             base_function = functools.partial(random_shift, pad=4)
             self.image_augmentation_function = torch.compile(base_function)
         self.use_drq = use_drq
+
+    def _is_distributed(self) -> bool:
+        """Check if distributed training is enabled."""
+        return dist.is_available() and dist.is_initialized()
+
+    def _get_distributed_info(self) -> tuple[int, int]:
+        """
+        Get rank and world_size for distributed training.
+        Returns (rank, world_size) or (0, 1) if not distributed.
+        """
+        if self._is_distributed():
+            return dist.get_rank(), dist.get_world_size()
+        return 0, 1
+
+    def _get_partitioned_indices(
+        self, num_indices: int, rank: int, world_size: int
+    ) -> tuple[int, int]:
+        """
+        Calculate the start and end indices for this rank's partition.
+        Similar to DistributedSampler, each rank gets a roughly equal partition.
+        """
+        # Calculate partition size
+        indices_per_rank = num_indices // world_size
+        remainder = num_indices % world_size
+
+        # Distribute remainder across first few ranks
+        start_idx = rank * indices_per_rank + min(rank, remainder)
+        end_idx = start_idx + indices_per_rank + (1 if rank < remainder else 0)
+
+        return start_idx, end_idx
 
     def _initialize_storage(
         self,
@@ -182,7 +223,30 @@ class ReplayBuffer:
                 else:
                     raise ValueError(f"Unsupported type {type(value)} for complementary_info[{key}]")
 
+        # Enable shared memory for multi-GPU training
+        if self.use_shared_memory:
+            self._enable_shared_memory()
+
         self.initialized = True
+
+    def _enable_shared_memory(self):
+        """Enable shared memory for all storage tensors."""
+        # Share all state tensors
+        for key in self.states:
+            self.states[key].share_memory_()
+            if not self.optimize_memory:
+                self.next_states[key].share_memory_()
+
+        # Share action, reward, done tensors
+        self.actions.share_memory_()
+        self.rewards.share_memory_()
+        self.dones.share_memory_()
+        self.truncateds.share_memory_()
+        self.episode_ends.share_memory_()
+
+        # Share complementary_info tensors
+        for key in self.complementary_info:
+            self.complementary_info[key].share_memory_()
 
     def __len__(self):
         return self.size
@@ -230,15 +294,87 @@ class ReplayBuffer:
         self.size = min(self.size + 1, self.capacity)
 
     def sample(self, batch_size: int) -> BatchTransition:
-        """Sample a random batch of transitions and collate them into batched tensors."""
+        """Sample a random batch of transitions and collate them into batched tensors.
+
+        For multi-GPU training with shared memory:
+        - Rank 0 samples N = batch_size * world_size indices globally
+        - Broadcasts these indices to all ranks
+        - Each rank takes every world_size-th index starting from its rank
+        This ensures non-overlapping samples across GPUs from a dynamic buffer.
+        """
         if not self.initialized:
             raise RuntimeError("Cannot sample from an empty buffer. Add transitions first.")
 
         batch_size = min(batch_size, self.size)
-        high = max(0, self.size - 1) if self.optimize_memory and self.size < self.capacity else self.size
+        current_size = (
+            max(0, self.size - 1)
+            if self.optimize_memory and self.size < self.capacity
+            else self.size
+        )
 
-        # Random indices for sampling - create on the same device as storage
-        idx = torch.randint(low=0, high=high, size=(batch_size,), device=self.storage_device)
+        if current_size == 0:
+            raise RuntimeError("Cannot sample from an empty buffer.")
+
+        # Handle distributed sampling with shared memory
+        rank, world_size = self._get_distributed_info()
+        if world_size > 1 and self.use_shared_memory:
+            # Global index sampler approach for shared memory buffers
+            # On rank 0: sample indices for all GPUs
+            if rank == 0:
+                # Sample N = batch_size * world_size indices globally
+                N = batch_size * world_size
+                N = min(N, current_size)
+                # Sample without replacement for better diversity
+                if N < current_size:
+                    idx_global = torch.randperm(current_size, device='cpu')[:N]
+                else:
+                    # If we need all indices, just use arange
+                    idx_global = torch.arange(current_size, device='cpu')
+            else:
+                # Other ranks: placeholder that will be overwritten by broadcast
+                idx_global = torch.zeros(
+                    batch_size * world_size, dtype=torch.long, device="cpu"
+                )
+
+            # Broadcast indices from rank 0 to all ranks
+            dist.broadcast(idx_global, src=0)
+
+            # Each rank takes every world_size-th index starting from its rank
+            # This ensures non-overlapping samples: rank 0 gets indices
+            # [0, world_size, 2*world_size, ...]
+            # rank 1 gets [1, world_size+1, 2*world_size+1, ...], etc.
+            idx_rank = idx_global[rank::world_size]
+
+            # Ensure we don't exceed batch_size
+            if len(idx_rank) > batch_size:
+                idx_rank = idx_rank[:batch_size]
+
+            idx = idx_rank.to(self.storage_device)
+        elif world_size > 1:
+            # Fallback to old partitioning approach for non-shared-memory
+            # distributed training
+            high = current_size
+            start_idx, end_idx = self._get_partitioned_indices(high, rank, world_size)
+            partition_size = end_idx - start_idx
+
+            if partition_size <= 0:
+                raise RuntimeError(
+                    f"Rank {rank} has no data to sample from "
+                    f"(partition size: {partition_size})"
+                )
+
+            batch_size = min(batch_size, partition_size)
+            idx = torch.randint(
+                low=start_idx,
+                high=end_idx,
+                size=(batch_size,),
+                device=self.storage_device,
+            )
+        else:
+            # Non-distributed: sample from entire buffer
+            idx = torch.randint(
+                low=0, high=current_size, size=(batch_size,), device=self.storage_device
+            )
 
         # Identify image keys that need augmentation
         image_keys = [k for k in self.states if k.startswith(OBS_IMAGE)] if self.use_drq else []
@@ -249,15 +385,21 @@ class ReplayBuffer:
 
         # First pass: load all state tensors to target device
         for key in self.states:
-            batch_state[key] = self.states[key][idx].to(self.device)
+            batch_state[key] = self.states[key][idx]
+            if key not in image_keys:
+                batch_state[key] = batch_state[key].to(self.device)
 
             if not self.optimize_memory:
                 # Standard approach - load next_states directly
-                batch_next_state[key] = self.next_states[key][idx].to(self.device)
+                batch_next_state[key] = self.next_states[key][idx]
+                if key not in image_keys:
+                    batch_next_state[key] = batch_next_state[key].to(self.device)
             else:
                 # Memory-optimized approach - get next_state from the next index
                 next_idx = (idx + 1) % self.capacity
-                batch_next_state[key] = self.states[key][next_idx].to(self.device)
+                batch_next_state[key] = self.states[key][next_idx]
+                if key not in image_keys:
+                    batch_next_state[key] = batch_next_state[key].to(self.device)
 
         # Apply image augmentation in a batched way if needed
         if self.use_drq and image_keys:
@@ -313,6 +455,10 @@ class ReplayBuffer:
         Creates an infinite iterator that yields batches of transitions.
         Will automatically restart when internal iterator is exhausted.
 
+        When distributed training is enabled (torch.distributed.is_initialized()),
+        each rank will only sample from its assigned partition of the buffer,
+        similar to DistributedSampler behavior.
+
         Args:
             batch_size (int): Size of batches to sample
             async_prefetch (bool): Whether to use asynchronous prefetching with threads (default: True)
@@ -357,6 +503,9 @@ class ReplayBuffer:
             while not shutdown_event.is_set():
                 try:
                     batch = self.sample(batch_size)
+                    if self.preprocessor is not None:
+                        batch['state'] = self.preprocessor(batch['state'])
+                        batch['next_state'] = self.preprocessor(batch['next_state'])
                     # The timeout ensures the thread unblocks if the queue is full
                     # and the shutdown event gets set meanwhile.
                     data_queue.put(batch, block=True, timeout=0.5)
@@ -422,6 +571,7 @@ class ReplayBuffer:
         use_drq: bool = True,
         storage_device: str = "cpu",
         optimize_memory: bool = False,
+        use_shared_memory: bool = False,
     ) -> "ReplayBuffer":
         """
         Convert a LeRobotDataset into a ReplayBuffer.
@@ -458,6 +608,7 @@ class ReplayBuffer:
             use_drq=use_drq,
             storage_device=storage_device,
             optimize_memory=optimize_memory,
+            use_shared_memory=use_shared_memory,
         )
 
         # Convert dataset to transitions
@@ -503,6 +654,10 @@ class ReplayBuffer:
                 truncated=False,  # NOTE: Truncation are not supported yet in lerobot dataset
                 complementary_info=data.get("complementary_info", None),
             )
+
+        # Enable shared memory after loading if needed (in case it wasn't enabled during initialization)
+        if use_shared_memory and replay_buffer.initialized:
+            replay_buffer._enable_shared_memory()
 
         return replay_buffer
 
