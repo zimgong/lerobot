@@ -50,8 +50,6 @@ class OfflineIQLConfig(SACConfig):
     # Polyak averaging coefficient for both critics and values
     value_target_update_weight: float | None = None
 
-    # Offline training loop control
-    offline_epochs: int = 10
 
     def __post_init__(self):
         super().__post_init__()

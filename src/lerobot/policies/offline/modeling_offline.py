@@ -407,16 +407,20 @@ class OfflineIQLPolicy(PreTrainedPolicy):
         actions: Tensor,
     ) -> tuple[Tensor, dict]:
         self._ensure_actor_encoder_trainable()
-        dist, _ = self._actor_distribution(
+        _, means = self._actor_distribution(
             observations=observations,
             observation_features=None,
             detach_encoder=False,
         )
-        log_prob = dist.log_prob(actions)
-        mean_log_prob = log_prob.mean()
-        loss = -mean_log_prob
+        # log_prob = dist.log_prob(actions)
+        # mean_log_prob = log_prob.mean()
+        # loss = -mean_log_prob
+        # info = {
+        #     "log_prob_mean": mean_log_prob.item(),
+        # }
+        loss = F.mse_loss(means, actions)
         info = {
-            "log_prob_mean": mean_log_prob.item(),
+            "mse_loss": loss.item(),
         }
         return loss, info
 
