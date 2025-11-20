@@ -218,7 +218,7 @@ def train(cfg: TrainRLServerPipelineConfig, job_name: str | None = None):
     logging.info(pformat(cfg.to_dict()))
 
     # Setup WandB logging if enabled
-    if cfg.wandb.enable and cfg.wandb.project and dist.get_rank() == 0:
+    if cfg.wandb.enable and cfg.wandb.project and dist_ctx.is_main_process:
         from lerobot.rl.wandb_utils import WandBLogger
 
         wandb_logger = WandBLogger(cfg)
