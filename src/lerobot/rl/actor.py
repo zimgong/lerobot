@@ -66,7 +66,7 @@ from lerobot.policies.factory import make_policy
 from lerobot.policies.sac.modeling_sac import SACPolicy
 from lerobot.processor import TransitionKey
 from lerobot.rl.process import ProcessSignalHandler
-from lerobot.rl.queue import get_last_item_from_queue
+from lerobot.rl.queue_rl import get_last_item_from_queue
 from lerobot.robots import so100_follower  # noqa: F401
 from lerobot.teleoperators import gamepad, so101_leader  # noqa: F401
 from lerobot.teleoperators.utils import TeleopEvents

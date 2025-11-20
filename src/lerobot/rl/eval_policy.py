@@ -20,6 +20,7 @@ from lerobot.configs import parser
 from lerobot.configs.train import TrainRLServerPipelineConfig
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.policies.factory import make_policy
+from lerobot.processor import TransitionKey
 from lerobot.robots import (  # noqa: F401
     RobotConfig,
     make_robot_from_config,
@@ -30,45 +31,67 @@ from lerobot.teleoperators import (
     so101_leader,  # noqa: F401
 )
 
-from .gym_manipulator import make_robot_env
+from .gym_manipulator import (
+    create_transition,
+    make_processors,
+    make_robot_env,
+    step_env_and_process_transition,
+)
 
 logging.basicConfig(level=logging.INFO)
-
-
-def eval_policy(env, policy, n_episodes):
-    sum_reward_episode = []
-    for _ in range(n_episodes):
-        obs, _ = env.reset()
-        episode_reward = 0.0
-        while True:
-            action = policy.select_action(obs)
-            obs, reward, terminated, truncated, _ = env.step(action)
-            episode_reward += reward
-            if terminated or truncated:
-                break
-        sum_reward_episode.append(episode_reward)
-
-    logging.info(f"Success after 20 steps {sum_reward_episode}")
-    logging.info(f"success rate {sum(sum_reward_episode) / len(sum_reward_episode)}")
 
 
 @parser.wrap()
 def main(cfg: TrainRLServerPipelineConfig):
     env_cfg = cfg.env
-    env = make_robot_env(env_cfg)
-    dataset_cfg = cfg.dataset
-    dataset = LeRobotDataset(repo_id=dataset_cfg.repo_id)
-    dataset_meta = dataset.meta
+    env, teleop_device = make_robot_env(env_cfg)
 
     policy = make_policy(
         cfg=cfg.policy,
-        # env_cfg=cfg.env,
-        ds_meta=dataset_meta,
+        env_cfg=cfg.env,
     )
-    policy.from_pretrained(env_cfg.pretrained_policy_name_or_path)
+    pretrained_policy_name_or_path = "/home/zimu.gong/huggingface/lerobot/outputs/train/2025-10-27/11-48-25_default_4090/checkpoints/last/pretrained_model"
+    policy.from_pretrained(pretrained_policy_name_or_path)
     policy.eval()
 
-    eval_policy(env, policy=policy, n_episodes=10)
+    env_processor, action_processor = make_processors(env, teleop_device, cfg.env, cfg.policy.device)
+    sum_reward_episode = []
+
+    n_episodes = 10
+
+    for _ in range(n_episodes):
+        obs, info = env.reset()
+        env_processor.reset()
+        action_processor.reset()
+        transition = create_transition(observation=obs, info=info)
+        transition = env_processor(transition)
+        episode_reward = 0.0
+        while True:
+            observation = {
+                k: v for k, v in transition[TransitionKey.OBSERVATION].items() if k in cfg.policy.input_features
+            }
+            action = policy.select_action(observation)
+            new_transition = step_env_and_process_transition(
+                env=env,
+                transition=transition,
+                action=action,
+                env_processor=env_processor,
+                action_processor=action_processor,
+            )
+
+            reward = new_transition[TransitionKey.REWARD]
+            done = new_transition.get(TransitionKey.DONE, False)
+            truncated = new_transition.get(TransitionKey.TRUNCATED, False)
+
+            transition = new_transition
+
+            episode_reward += reward
+            if done or truncated:
+                break
+        sum_reward_episode.append(episode_reward)
+
+    logging.info(f"Success after 20 steps {sum_reward_episode}")
+    logging.info(f"success rate {sum(sum_reward_episode) / len(sum_reward_episode)}")
 
 
 if __name__ == "__main__":

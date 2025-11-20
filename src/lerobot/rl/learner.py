@@ -46,17 +46,20 @@ https://github.com/michel-aractingi/lerobot-hilserl-guide
 
 import logging
 import os
-import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from pprint import pformat
+from typing import Any
 
 import grpc
 import torch
+import torch.distributed as dist
 from termcolor import colored
 from torch import nn
 from torch.multiprocessing import Queue
+from torch.nn.parallel import DistributedDataParallel
 from torch.optim.optimizer import Optimizer
 
 from lerobot.cameras import opencv  # noqa: F401
@@ -100,7 +103,21 @@ from lerobot.utils.utils import (
     init_logging,
 )
 
-from .learner_service import MAX_WORKERS, SHUTDOWN_TIMEOUT, LearnerService
+from lerobot.rl.learner_service import MAX_WORKERS, SHUTDOWN_TIMEOUT, LearnerService
+
+
+@dataclass(slots=True)
+class DistributedContext:
+    enabled: bool = False
+    rank: int = 0
+    world_size: int = 1
+    local_rank: int = 0
+    device: torch.device | None = None
+    backend: str | None = None
+
+    @property
+    def is_main_process(self) -> bool:
+        return self.rank == 0
 
 
 @parser.wrap()
@@ -119,6 +136,52 @@ def train_cli(cfg: TrainRLServerPipelineConfig):
     logging.info("[LEARNER] train_cli finished")
 
 
+def setup_distributed(cfg: TrainRLServerPipelineConfig) -> DistributedContext:
+    world_size_env = int(os.environ.get("WORLD_SIZE", "1"))
+    backend = os.environ.get("TORCH_DISTRIBUTED_BACKEND")
+
+    if world_size_env <= 1:
+        device = get_safe_torch_device(try_device=cfg.policy.device, log=True)
+        return DistributedContext(
+            enabled=False,
+            rank=0,
+            world_size=1,
+            local_rank=0,
+            device=device,
+            backend=None,
+        )
+
+    if not dist.is_available():
+        raise RuntimeError(
+            "torch.distributed is not available but distributed execution was requested (WORLD_SIZE > 1)."
+        )
+
+    if backend is None:
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+
+    if not dist.is_initialized():
+        dist.init_process_group(backend=backend)
+
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    local_rank = int(os.environ.get("LOCAL_RANK", rank))
+
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = get_safe_torch_device(try_device=cfg.policy.device, log=True)
+
+    return DistributedContext(
+        enabled=True,
+        rank=rank,
+        world_size=world_size,
+        local_rank=local_rank,
+        device=device,
+        backend=backend,
+    )
+
+
 def train(cfg: TrainRLServerPipelineConfig, job_name: str | None = None):
     """
     Main training function that initializes and runs the training process.
@@ -129,6 +192,10 @@ def train(cfg: TrainRLServerPipelineConfig, job_name: str | None = None):
     """
 
     cfg.validate()
+
+    dist_ctx = setup_distributed(cfg)
+    if dist_ctx.device is not None:
+        cfg.policy.device = str(dist_ctx.device)
 
     if job_name is None:
         job_name = cfg.job_name
@@ -151,7 +218,7 @@ def train(cfg: TrainRLServerPipelineConfig, job_name: str | None = None):
     logging.info(pformat(cfg.to_dict()))
 
     # Setup WandB logging if enabled
-    if cfg.wandb.enable and cfg.wandb.project:
+    if cfg.wandb.enable and cfg.wandb.project and dist.get_rank() == 0:
         from lerobot.rl.wandb_utils import WandBLogger
 
         wandb_logger = WandBLogger(cfg)
@@ -174,6 +241,7 @@ def train(cfg: TrainRLServerPipelineConfig, job_name: str | None = None):
         cfg=cfg,
         wandb_logger=wandb_logger,
         shutdown_event=shutdown_event,
+        dist_ctx=dist_ctx,
     )
 
 
@@ -181,6 +249,7 @@ def start_learner_threads(
     cfg: TrainRLServerPipelineConfig,
     wandb_logger: WandBLogger | None,
     shutdown_event: any,  # Event,
+    dist_ctx: DistributedContext | None = None,
 ) -> None:
     """
     Start the learner threads for training.
@@ -189,11 +258,13 @@ def start_learner_threads(
         cfg (TrainRLServerPipelineConfig): Training configuration
         wandb_logger (WandBLogger | None): Logger for metrics
         shutdown_event: Event to signal shutdown
+        dist_ctx (DistributedContext | None): Distributed context
     """
     # Create multiprocessing queues
-    transition_queue = Queue()
-    interaction_message_queue = Queue()
-    parameters_queue = Queue()
+    is_main_rank = not dist_ctx.enabled or dist_ctx.is_main_process
+    transition_queue = Queue() if is_main_rank else None
+    interaction_message_queue = Queue() if is_main_rank else None
+    parameters_queue = Queue() if is_main_rank else None
 
     concurrency_entity = None
 
@@ -206,18 +277,21 @@ def start_learner_threads(
 
         concurrency_entity = Process
 
-    communication_process = concurrency_entity(
-        target=start_learner,
-        args=(
-            parameters_queue,
-            transition_queue,
-            interaction_message_queue,
-            shutdown_event,
-            cfg,
-        ),
-        daemon=True,
-    )
-    communication_process.start()
+    communication_process = None
+
+    if is_main_rank:
+        communication_process = concurrency_entity(
+            target=start_learner,
+            args=(
+                parameters_queue,
+                transition_queue,
+                interaction_message_queue,
+                shutdown_event,
+                cfg,
+            ),
+            daemon=True,
+        )
+        communication_process.start()
 
     add_actor_information_and_train(
         cfg=cfg,
@@ -226,23 +300,27 @@ def start_learner_threads(
         transition_queue=transition_queue,
         interaction_message_queue=interaction_message_queue,
         parameters_queue=parameters_queue,
+        dist_ctx=dist_ctx,
     )
     logging.info("[LEARNER] Training process stopped")
 
-    logging.info("[LEARNER] Closing queues")
-    transition_queue.close()
-    interaction_message_queue.close()
-    parameters_queue.close()
+    if is_main_rank:
+        logging.info("[LEARNER] Closing queues")
+        transition_queue.close()
+        interaction_message_queue.close()
+        parameters_queue.close()
 
-    communication_process.join()
-    logging.info("[LEARNER] Communication process joined")
+        communication_process.join()
+        logging.info("[LEARNER] Communication process joined")
 
-    logging.info("[LEARNER] join queues")
-    transition_queue.cancel_join_thread()
-    interaction_message_queue.cancel_join_thread()
-    parameters_queue.cancel_join_thread()
+        logging.info("[LEARNER] join queues")
+        transition_queue.cancel_join_thread()
+        interaction_message_queue.cancel_join_thread()
+        parameters_queue.cancel_join_thread()
 
-    logging.info("[LEARNER] queues closed")
+        logging.info("[LEARNER] queues closed")
+    else:
+        logging.info("[LEARNER] Worker rank completed training loop")
 
 
 # Core algorithm functions
@@ -255,6 +333,7 @@ def add_actor_information_and_train(
     transition_queue: Queue,
     interaction_message_queue: Queue,
     parameters_queue: Queue,
+    dist_ctx: DistributedContext | None = None,
 ):
     """
     Handles data transfer from the actor to the learner, manages training updates,
@@ -279,10 +358,16 @@ def add_actor_information_and_train(
         transition_queue (Queue): Queue for receiving transitions from the actor.
         interaction_message_queue (Queue): Queue for receiving interaction messages from the actor.
         parameters_queue (Queue): Queue for sending policy parameters to the actor.
+        dist_ctx (DistributedContext | None): Distributed context
     """
-    # Extract all configuration variables at the beginning, it improve the speed performance
-    # of 7%
-    device = get_safe_torch_device(try_device=cfg.policy.device, log=True)
+    # Extract configuration variables at the beginning to improve
+    # speed (approx. 7% gain in profiling)
+    distributed = dist_ctx.enabled
+    is_main_rank = not distributed or dist_ctx.is_main_process
+
+    device = dist_ctx.device if dist_ctx.device is not None else get_safe_torch_device(
+        try_device=cfg.policy.device, log=True
+    )
     storage_device = get_safe_torch_device(try_device=cfg.policy.storage_device)
     clip_grad_norm_value = cfg.policy.grad_clip_norm
     online_step_before_learning = cfg.policy.online_step_before_learning
@@ -318,7 +403,30 @@ def add_actor_information_and_train(
 
     policy.train()
 
-    push_actor_policy_to_queue(parameters_queue=parameters_queue, policy=policy)
+    if is_main_rank and parameters_queue is not None:
+        push_actor_policy_to_queue(parameters_queue=parameters_queue, policy=policy)
+
+    if distributed:
+        ddp_kwargs: dict[str, Any] = {
+            "broadcast_buffers": False,
+            "find_unused_parameters": True,  # Required because SAC uses different model types
+            # ("critic", "discrete_critic", "actor", "temperature") in separate forward passes
+        }
+        if device.type == "cuda":
+            assert device.index is not None
+            ddp_kwargs["device_ids"] = [device.index]
+            ddp_kwargs["output_device"] = device.index
+        policy_module = DistributedDataParallel(policy, **ddp_kwargs)
+        policy_module.train()
+        policy = policy_module.module
+    else:
+        policy_module = policy
+
+    if is_main_rank and parameters_queue is not None:
+        push_actor_policy_to_queue(
+            parameters_queue=parameters_queue,
+            policy=policy,
+        )
 
     last_time_policy_pushed = time.time()
 
@@ -330,24 +438,23 @@ def add_actor_information_and_train(
     log_training_info(cfg=cfg, policy=policy)
 
     # Log actor training start step configuration
-    if actor_training_start_step is not None:
-        logging.info(
-            colored(
-                f"[LEARNER] Critic-only training enabled. Actor training will start at optimization step {actor_training_start_step}",
-                color="yellow",
-                attrs=["bold"],
-            )
+    if actor_training_start_step is not None and (not distributed or is_main_rank):
+        critic_only_message = (
+            "[LEARNER] Critic-only training enabled. Actor training will "
+            f"start at optimization step {actor_training_start_step}"
         )
-    else:
-        logging.info(
-            colored(
-                "[LEARNER] Actor and critic training enabled from the start",
-                color="green",
-                attrs=["bold"],
-            )
-        )
+        logging.info(colored(critic_only_message, color="yellow", attrs=["bold"]))
+    elif not distributed or is_main_rank:
+        start_message = "[LEARNER] Actor and critic training enabled from the start"
+        logging.info(colored(start_message, color="green", attrs=["bold"]))
 
-    replay_buffer = initialize_replay_buffer(cfg, device, storage_device, observation_preprocessor)
+    if distributed and not is_main_rank:
+        dist.barrier()
+    replay_buffer = initialize_replay_buffer(
+        cfg, device, storage_device, observation_preprocessor, dist_ctx
+    )
+    if distributed and is_main_rank:
+        dist.barrier()
     batch_size = cfg.batch_size
     offline_replay_buffer = None
 
@@ -376,27 +483,62 @@ def add_actor_information_and_train(
     # NOTE: THIS IS THE MAIN LOOP OF THE LEARNER
     while True:
         # Exit the training loop if shutdown is requested
+        # if distributed:
+        #     print(f"Learner rank {dist_ctx.rank} broadcasting flag")
+        #     should_exit = broadcast_flag(
+        #         1 if (is_main_rank and shutdown_event is not None and shutdown_event.is_set()) else 0,
+        #         dist_ctx=dist_ctx,
+        #         device=device,
+        #     )
+        #     print(f"Learner rank {dist_ctx.rank} should exit: {should_exit}")
+        #     if should_exit:
+        #         if is_main_rank:
+        #             logging.info("[LEARNER] Shutdown signal received. Exiting...")
+        #         if replay_buffer.shared_memory_manager:
+        #             replay_buffer.shared_memory_manager.cleanup(dist_ctx.rank)
+        #         if offline_replay_buffer.shared_memory_manager:
+        #             offline_replay_buffer.shared_memory_manager.cleanup(dist_ctx.rank)
+        #         break
+        # else:
         if shutdown_event is not None and shutdown_event.is_set():
             logging.info("[LEARNER] Shutdown signal received. Exiting...")
+            if distributed:
+                if replay_buffer.shared_memory_manager:
+                    replay_buffer.shared_memory_manager.cleanup(dist_ctx.rank)
+                if offline_replay_buffer.shared_memory_manager:
+                    offline_replay_buffer.shared_memory_manager.cleanup(dist_ctx.rank)
+                try:
+                    dist.destroy_process_group()
+                    logging.info("[LEARNER] Destroyed distributed process group.")
+                except Exception as e:
+                    logging.error(f"Error destroying process group: {e}")
             break
-
+    
         # Process all available transitions to the replay buffer, send by the actor server
-        process_transitions(
-            transition_queue=transition_queue,
-            replay_buffer=replay_buffer,
-            offline_replay_buffer=offline_replay_buffer,
-            device=device,
-            dataset_repo_id=dataset_repo_id,
-            shutdown_event=shutdown_event,
-        )
+        if is_main_rank and transition_queue is not None:
+            process_transitions(
+                transition_queue=transition_queue,
+                replay_buffer=replay_buffer,
+                offline_replay_buffer=offline_replay_buffer,
+                device=device,
+                dataset_repo_id=dataset_repo_id,
+                shutdown_event=shutdown_event,
+            )
+        elif distributed and not is_main_rank:
+            # Only initialize if not already initialized
+            # This will receive metadata broadcast from rank 0 if it just initialized
+            if not replay_buffer.initialized:
+                replay_buffer._initialize_storage()
+
 
         # Process all available interaction messages sent by the actor server
-        interaction_message = process_interaction_messages(
-            interaction_message_queue=interaction_message_queue,
-            interaction_step_shift=interaction_step_shift,
-            wandb_logger=wandb_logger,
-            shutdown_event=shutdown_event,
-        )
+        if is_main_rank and interaction_message_queue is not None:
+            interaction_message = process_interaction_messages(
+                interaction_message_queue=interaction_message_queue,
+                interaction_step_shift=interaction_step_shift,
+                wandb_logger=wandb_logger,
+                shutdown_event=shutdown_event,
+            )
 
         # Wait until the replay buffer has enough samples to start training
         if len(replay_buffer) < online_step_before_learning:
@@ -447,7 +589,7 @@ def add_actor_information_and_train(
             }
 
             # Use the forward method for critic loss
-            critic_output = policy.forward(forward_batch, model="critic")
+            critic_output = policy_module.forward(forward_batch, model="critic")
 
             # Main critic optimization
             loss_critic = critic_output["loss_critic"]
@@ -460,7 +602,7 @@ def add_actor_information_and_train(
 
             # Discrete critic optimization (if available)
             if policy.config.num_discrete_actions is not None:
-                discrete_critic_output = policy.forward(forward_batch, model="discrete_critic")
+                discrete_critic_output = policy_module.forward(forward_batch, model="discrete_critic")
                 loss_discrete_critic = discrete_critic_output["loss_discrete_critic"]
                 optimizers["discrete_critic"].zero_grad()
                 loss_discrete_critic.backward()
@@ -504,7 +646,7 @@ def add_actor_information_and_train(
             "next_observation_feature": next_observation_features,
         }
 
-        critic_output = policy.forward(forward_batch, model="critic")
+        critic_output = policy_module.forward(forward_batch, model="critic")
 
         loss_critic = critic_output["loss_critic"]
         optimizers["critic"].zero_grad()
@@ -522,7 +664,7 @@ def add_actor_information_and_train(
 
         # Discrete critic optimization (if available)
         if policy.config.num_discrete_actions is not None:
-            discrete_critic_output = policy.forward(forward_batch, model="discrete_critic")
+            discrete_critic_output = policy_module.forward(forward_batch, model="discrete_critic")
             loss_discrete_critic = discrete_critic_output["loss_discrete_critic"]
             optimizers["discrete_critic"].zero_grad()
             loss_discrete_critic.backward()
@@ -532,8 +674,9 @@ def add_actor_information_and_train(
             optimizers["discrete_critic"].step()
 
             # Add discrete critic info to training info
-            training_infos["loss_discrete_critic"] = loss_discrete_critic.item()
-            training_infos["discrete_critic_grad_norm"] = discrete_critic_grad_norm
+            if not distributed or is_main_rank:
+                training_infos["loss_discrete_critic"] = loss_discrete_critic.item()
+                training_infos["discrete_critic_grad_norm"] = discrete_critic_grad_norm
 
         # Actor and temperature optimization (at specified frequency)
         # Only train actor if actor_training_start_step is None or we've reached that step
@@ -552,7 +695,7 @@ def add_actor_information_and_train(
         if should_train_actor and optimization_step % policy_update_freq == 0:
             for _ in range(policy_update_freq):
                 # Actor optimization
-                actor_output = policy.forward(forward_batch, model="actor")
+                actor_output = policy_module.forward(forward_batch, model="actor")
                 loss_actor = actor_output["loss_actor"]
                 optimizers["actor"].zero_grad()
                 loss_actor.backward()
@@ -562,11 +705,12 @@ def add_actor_information_and_train(
                 optimizers["actor"].step()
 
                 # Add actor info to training info
-                training_infos["loss_actor"] = loss_actor.item()
-                training_infos["actor_grad_norm"] = actor_grad_norm
+                if not distributed or is_main_rank:
+                    training_infos["loss_actor"] = loss_actor.item()
+                    training_infos["actor_grad_norm"] = actor_grad_norm
 
                 # Temperature optimization
-                temperature_output = policy.forward(forward_batch, model="temperature")
+                temperature_output = policy_module.forward(forward_batch, model="temperature")
                 loss_temperature = temperature_output["loss_temperature"]
                 optimizers["temperature"].zero_grad()
                 loss_temperature.backward()
@@ -576,15 +720,20 @@ def add_actor_information_and_train(
                 optimizers["temperature"].step()
 
                 # Add temperature info to training info
-                training_infos["loss_temperature"] = loss_temperature.item()
-                training_infos["temperature_grad_norm"] = temp_grad_norm
-                training_infos["temperature"] = policy.temperature
+                if not distributed or is_main_rank:
+                    training_infos["loss_temperature"] = loss_temperature.item()
+                    training_infos["temperature_grad_norm"] = temp_grad_norm
+                    training_infos["temperature"] = policy.temperature
 
                 # Update temperature
                 policy.update_temperature()
 
-        # Push policy to actors if needed
-        if time.time() - last_time_policy_pushed > policy_parameters_push_frequency:
+        # Push policy to actors if needed (main rank only)
+        if (
+            is_main_rank
+            and parameters_queue is not None
+            and time.time() - last_time_policy_pushed > policy_parameters_push_frequency
+        ):
             push_actor_policy_to_queue(parameters_queue=parameters_queue, policy=policy)
             last_time_policy_pushed = time.time()
 
@@ -592,7 +741,7 @@ def add_actor_information_and_train(
         policy.update_target_networks()
 
         # Log training metrics at specified intervals
-        if optimization_step % log_freq == 0:
+        if (not distributed or is_main_rank) and optimization_step % log_freq == 0:
             training_infos["replay_buffer_size"] = len(replay_buffer)
             if offline_replay_buffer is not None:
                 training_infos["offline_replay_buffer_size"] = len(offline_replay_buffer)
@@ -606,10 +755,14 @@ def add_actor_information_and_train(
         time_for_one_optimization_step = time.time() - time_for_one_optimization_step
         frequency_for_one_optimization_step = 1 / (time_for_one_optimization_step + 1e-9)
 
-        logging.info(f"[LEARNER] Optimization frequency loop [Hz]: {frequency_for_one_optimization_step}")
+        if not distributed or is_main_rank:
+            logging.info(
+                "[LEARNER] Optimization frequency loop [Hz]: %.3f",
+                frequency_for_one_optimization_step,
+            )
 
         # Log optimization frequency
-        if wandb_logger:
+        if (not distributed or is_main_rank) and wandb_logger:
             wandb_logger.log_dict(
                 {
                     "Optimization frequency loop [Hz]": frequency_for_one_optimization_step,
@@ -620,11 +773,18 @@ def add_actor_information_and_train(
             )
 
         optimization_step += 1
-        if optimization_step % log_freq == 0:
-            logging.info(f"[LEARNER] Number of optimization step: {optimization_step}")
+        if (not distributed or is_main_rank) and optimization_step % log_freq == 0:
+            logging.info(
+                "[LEARNER] Number of optimization step: %d",
+                optimization_step,
+            )
 
         # Save checkpoint at specified intervals
-        if saving_checkpoint and (optimization_step % save_freq == 0 or optimization_step == online_steps):
+        if (
+            saving_checkpoint
+            and is_main_rank
+            and (optimization_step % save_freq == 0 or optimization_step == online_steps)
+        ):
             save_training_checkpoint(
                 cfg=cfg,
                 optimization_step=optimization_step,
@@ -968,7 +1128,7 @@ def log_training_info(cfg: TrainRLServerPipelineConfig, policy: nn.Module) -> No
 
 
 def initialize_replay_buffer(
-    cfg: TrainRLServerPipelineConfig, device: str, storage_device: str, preprocessor: None
+    cfg: TrainRLServerPipelineConfig, device: str, storage_device: str, preprocessor: None, dist_ctx: DistributedContext
 ) -> ReplayBuffer:
     """
     Initialize a replay buffer, either empty or from a dataset if resuming.
@@ -977,6 +1137,8 @@ def initialize_replay_buffer(
         cfg (TrainRLServerPipelineConfig): Training configuration
         device (str): Device to store tensors on
         storage_device (str): Device for storage optimization
+        preprocessor: Optional preprocessor for observations
+        dist_ctx (DistributedContext | None): Distributed context for multi-GPU training
 
     Returns:
         ReplayBuffer: Initialized replay buffer
@@ -990,6 +1152,7 @@ def initialize_replay_buffer(
             use_drq=False,
             optimize_memory=True,
             preprocessor=preprocessor,
+            buffer_name="online_replay_buffer",
         )
 
     logging.info("Resume training load the online dataset")
@@ -1010,6 +1173,7 @@ def initialize_replay_buffer(
         device=device,
         state_keys=cfg.policy.input_features.keys(),
         optimize_memory=True,
+        buffer_name="online_replay_buffer",
     )
 
 
@@ -1026,6 +1190,7 @@ def initialize_offline_replay_buffer(
         cfg (TrainRLServerPipelineConfig): Training configuration
         device (str): Device to store tensors on
         storage_device (str): Device for storage optimization
+        preprocessor: Optional preprocessor for observations
 
     Returns:
         ReplayBuffer: Initialized offline replay buffer
@@ -1051,12 +1216,29 @@ def initialize_offline_replay_buffer(
         storage_device=storage_device,
         optimize_memory=True,
         capacity=cfg.policy.offline_buffer_capacity,
+        buffer_name="offline_replay_buffer",
     )
     offline_replay_buffer.preprocessor = preprocessor
     return offline_replay_buffer
 
 
 # Utilities/Helpers functions
+def broadcast_flag(value: int, dist_ctx: DistributedContext, device: torch.device) -> int:
+    if not dist_ctx.enabled:
+        return value
+
+    # Use the device from dist_ctx which is the correct device for this rank
+    # For NCCL backend, this will be the local CUDA device (e.g., cuda:0, cuda:1)
+    # For gloo backend, this will be CPU
+    broadcast_device = dist_ctx.device if dist_ctx.device is not None else device
+    
+    if dist_ctx.is_main_process:
+        tensor = torch.tensor([value], dtype=torch.uint8, device=broadcast_device)
+    else:
+        tensor = torch.zeros(1, dtype=torch.uint8, device=broadcast_device)
+
+    dist.broadcast(tensor, src=0, async_op=True)
+    return int(tensor.item())
 
 
 def get_observation_features(
