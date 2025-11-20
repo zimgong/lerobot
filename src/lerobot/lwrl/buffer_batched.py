@@ -657,6 +657,61 @@ class ParallelReplayBuffer:
         self.position[env_idx] = (self.position[env_idx] + 1) % self.capacity
         self.size[env_idx] = min(self.size[env_idx] + 1, self.capacity)
 
+    def _success_episode_num(self) -> int:
+        """Count the number of successful episodes in the buffer.
+        
+        An episode is considered successful if at least one frame has
+        complementary_info.success == 1.0 (or complementary_info.is_success == 1.0 for backward compatibility).
+        
+        Returns:
+            int: Number of successful episodes
+        """
+        if not self.initialized:
+            return 0
+        
+        total_success_episodes = 0
+        
+        # Check if complementary_info has success key (try both "success" and "is_success" for compatibility)
+        success_key = None
+        if self.has_complementary_info:
+            if "is_success" in self.complementary_info_keys:
+                success_key = "is_success"
+        
+        if success_key is None:
+            # If no success key, return 0 (no successful episodes by definition)
+            return 0
+        
+        # Iterate through all environments and count successful episodes
+        for env_idx in range(self.num_envs):
+            env_size = self.size[env_idx].item()
+            if env_size == 0:
+                continue
+            
+            # Track current episode
+            episode_is_success = False
+            
+            for frame_idx in range(env_size):
+                actual_idx = (self.position[env_idx] - env_size + frame_idx) % self.capacity
+                
+                # Check if this frame indicates success
+                if success_key in self.complementary_info:
+                    success_val = self.complementary_info[success_key][env_idx, actual_idx]
+                    if isinstance(success_val, torch.Tensor):
+                        if success_val.item() == 1.0:
+                            episode_is_success = True
+                    elif success_val == 1.0:
+                        episode_is_success = True
+                
+                # If we reached an episode boundary, check if it was successful
+                if self.dones[env_idx, actual_idx] or self.truncateds[env_idx, actual_idx]:
+                    if episode_is_success:
+                        total_success_episodes += 1
+                    
+                    # Reset for next episode
+                    episode_is_success = False
+        
+        return total_success_episodes
+
     def to_lerobot_dataset(
         self,
         repo_id: str,
@@ -785,6 +840,9 @@ class ParallelReplayBuffer:
         #! note: remaining frames will be discarded
 
         lerobot_dataset.stop_image_writer()
+        # CRITICAL: finalize() must be called to close parquet writers and write metadata footers
+        # Without this, parquet files will be corrupted/incomplete and cannot be loaded
+        lerobot_dataset.finalize()
 
         return lerobot_dataset
 
