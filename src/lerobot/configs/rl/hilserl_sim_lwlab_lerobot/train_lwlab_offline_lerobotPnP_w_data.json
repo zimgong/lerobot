@@ -1,6 +1,6 @@
 {    
     "output_dir": null,
-    "job_name": "lwlab_lerobot_pickup_280episodes_offline",
+    "job_name": "lwlab_lerobot_pickup_280episodes_offline_rl_online_buffer",
     "resume": false,
     "resume_from_output_dir": "/home/johndoe/Documents/lerobot-hilserl/outputs/train/2025-11-09/10-24-39_lwlab_lerobot_pickup_280episodes_offline_warmup",
     "seed": 1000,
@@ -11,7 +11,7 @@
     "save_checkpoint": true,
     "save_freq": 2500,
     "wandb": {
-        "enable": false,
+        "enable": true,
         "mode": "online",
         "project": "lwlab_sim",
         "disable_artifact": true
@@ -23,13 +23,14 @@
     },
     "offline": {
         "iters": 100,
-        "iql_steps": 2500,
-        "bc_steps_after_merge": 2000,
+        "iql_steps": 1000,
+        "bc_steps_after_merge": 1000,
         "sync_critic_encoder_after_bc": false,
         "success_keep_ratio": 1.0,
-        "ope_threshold": 0.02,
-        "ope_min_episodes": 10,
-        "pretrain_path": "/home/johndoe/Documents/lerobot-hilserl/outputs/train/2025-11-09/10-24-39_lwlab_lerobot_pickup_280episodes_offline_warmup/checkpoints/050000/policy_50000.pkl"
+        "ope_adaptive_threshold_fraction": 0.05,
+        "max_ope_iterations": 5,
+        "pretrain_path": "/home/johndoe/Documents/lerobot-hilserl/outputs/train/2025-11-09/10-24-39_lwlab_lerobot_pickup_280episodes_offline_warmup/checkpoints/050000/policy_50000.pkl", 
+        "ope_num_samples": 10000
     },
     "policy": {
         "type": "offline",
@@ -258,7 +259,7 @@
         "shared_encoder": true,
         "online_steps": 1000000,
         "online_buffer_capacity": 100000,
-        "offline_buffer_capacity": 70000,
+        "offline_buffer_capacity": 100000,
         "online_step_before_learning": 100,
         "policy_update_freq": 1,
         "discount": 0.97,

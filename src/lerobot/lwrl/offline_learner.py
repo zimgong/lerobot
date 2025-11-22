@@ -60,7 +60,7 @@ from lerobot.utils.utils import (
 
 from lerobot.rl.learner_service import MAX_WORKERS, SHUTDOWN_TIMEOUT, LearnerService
 from lerobot.lwrl.buffer_batched import ParallelReplayBuffer
-from lerobot.lwrl.ope import amq_score_from_buffer
+from lerobot.lwrl.ope import amq_score_from_buffer, amq_score_from_buffer_online
 from lerobot.lwrl.buffer_utils import merge_offline_online_success
 
 # Import functions called BY add_actor_information_and_train from learner.py
@@ -70,7 +70,6 @@ from lerobot.lwrl.learner import (
     load_training_state,
     log_training_info,
     process_transitions,
-    process_interaction_message,
     process_interaction_messages,
     check_nan_in_transition,
     get_observation_features,
@@ -275,17 +274,18 @@ def add_actor_information_and_train(
     offline_iters = cfg.offline.iters
     iql_steps_per_iter = cfg.offline.iql_steps
     bc_steps_after_merge = cfg.offline.bc_steps_after_merge
-    ope_threshold = cfg.offline.ope_threshold
-    ope_min_episodes = cfg.offline.ope_min_episodes
-    accepted_policy_score = float("-inf")
+    bc_warmup_steps = cfg.offline.bc_steps_after_merge
+    ope_adaptive_threshold_fraction = cfg.offline.ope_adaptive_threshold_fraction
+    max_ope_iterations = cfg.offline.max_ope_iterations
+    ope_iterations = 0
 
-    # load pretrain manually (not resume since it will corrupt logging)
-    if cfg.offline.pretrain_path is not None:
-        # might cause error if the policy is not compatible with the current config
-        import pickle as pkl
-        logging.info(f"Loading pretrain from {cfg.offline.pretrain_path} manually. Need to be replaced by resume logic in the future.")
-        policy: CurrentPolicy = pkl.load(open(cfg.offline.pretrain_path, "rb"))
-        policy.to(device)
+    # # load pretrain manually (not resume since it will corrupt logging)
+    # if cfg.offline.pretrain_path is not None:
+    #     # might cause error if the policy is not compatible with the current config
+    #     import pickle as pkl
+    #     logging.info(f"Loading pretrain from {cfg.offline.pretrain_path} manually. Need to be replaced by resume logic in the future.")
+    #     policy: CurrentPolicy = pkl.load(open(cfg.offline.pretrain_path, "rb"))
+    #     policy.to(device)
 
     # Initialize logging for multiprocessing
     if not use_threads(cfg):
@@ -320,10 +320,11 @@ def add_actor_information_and_train(
     offline_replay_buffer = None
 
     if cfg.dataset is not None:
-        offline_replay_buffer = initialize_offline_replay_buffer(
+        offline_replay_buffer, allowed_features = initialize_offline_replay_buffer(
             cfg=cfg,
             device=device,
             storage_device=storage_device,
+            return_features=True,
         )
         batch_size: int = batch_size # // 2  # We will sample from both replay buffer
     else:
@@ -339,16 +340,104 @@ def add_actor_information_and_train(
         dataset_repo_id = cfg.dataset.repo_id
 
     # Initialize iterators
-    # online_iterator = None
+    online_iterator = None
     offline_iterator = None
 
-    if resume_optimization_step is not None:
-        progress_bar.update(resume_optimization_step)
-        last_accept_step = resume_optimization_step
+    # if resume_optimization_step is not None:
+    #     progress_bar.update(resume_optimization_step)
+    #     last_accept_step = resume_optimization_step
+
+    # bc warm up
+
+    if bc_warmup_steps > 0:
+        logging.info(f"[OFFLINE] Running BC warmup for {bc_warmup_steps} steps")
+
+        if online_iterator is None:
+            online_iterator = replay_buffer.get_iterator(
+                batch_size=batch_size, async_prefetch=async_prefetch, queue_size=2
+            )
+        
+        if offline_replay_buffer is not None and offline_iterator is None:
+            offline_iterator = offline_replay_buffer.get_iterator(
+                batch_size=batch_size, async_prefetch=async_prefetch, queue_size=2
+            )
+
+        original_encoder_requires_grad = None
+        if hasattr(policy.actor.encoder, "image_encoder") and len(list(policy.actor.encoder.image_encoder.parameters())) > 0:
+            original_encoder_requires_grad = next(policy.actor.encoder.image_encoder.parameters()).requires_grad
+        
+        # Ensure actor encoder is trainable
+        policy._ensure_actor_encoder_trainable()
+
+        for bc_step in tqdm(range(bc_warmup_steps), desc="BC warmup"):
+
+            # Process all available transitions to the replay buffer, send by the actor server
+            process_transitions(
+                transition_queue=transition_queue,
+                replay_buffer=replay_buffer,
+                offline_replay_buffer=offline_replay_buffer,
+                device=storage_device,
+                dataset_repo_id=dataset_repo_id,
+                shutdown_event=shutdown_event,
+            )
+
+            # Process all available interaction messages sent by the actor server
+            interaction_message = process_interaction_messages(
+                interaction_message_queue=interaction_message_queue,
+                interaction_step_shift=interaction_step_shift,
+                wandb_logger=wandb_logger,
+                shutdown_event=shutdown_event,
+            )
+
+            offline_batch = next(offline_iterator)
+            online_batch = next(online_iterator)
+            batch = concatenate_batch_transitions(
+                left_batch_transitions=offline_batch, right_batch_transition=online_batch
+            )
+
+            actions = batch[ACTION]
+            observations = batch["state"]
+            next_observations = batch["next_state"]
+            check_nan_in_transition(observations=observations, actions=actions, next_state=next_observations)
+
+            observation_features, _ = get_observation_features(
+                policy=policy, observations=observations, next_observations=next_observations
+            )
+
+            forward_batch = {
+                ACTION: actions,
+                "state": observations,
+                "observation_feature": observation_features,
+            }
+
+            bc_out = policy.forward(forward_batch, model="actor_bc")
+            optimizers["actor"].zero_grad()
+            bc_out["loss_actor_bc"].backward()
+            clip_grad_norm_(policy.actor.parameters(), clip_grad_norm_value)
+            optimizers["actor"].step()
+
+            if wandb_logger is not None and bc_step % log_freq == 0:
+                wandb_logger.log_dict(
+                    {"bc_loss": bc_out["loss_actor_bc"].item(), "BC step": bc_step},
+                    mode="train",
+                    custom_step_key="BC step",
+                )
+        
+        # Reset encoder requires_grad to original value if it was set
+        if original_encoder_requires_grad is not None:
+            for param in policy.actor.encoder.image_encoder.parameters():
+                param.requires_grad_(original_encoder_requires_grad)
+        
+        # Optionally sync encoders if not shared
+        if cfg.offline.sync_critic_encoder_after_bc and not policy.shared_encoder:
+            logging.info("[OFFLINE] Syncing critic encoder with actor encoder after BC...")
+            policy.encoder_critic.load_state_dict(policy.actor.encoder.state_dict(), strict=False)
     
     # NOTE: THIS IS THE MAIN LOOP OF THE LEARNER
     # Outer loop: iterative offline stage
     for it in range(offline_iters):
+        ope_iterations += 1
+
         logging.info(f"[OFFLINE] Starting iteration {it+1}/{offline_iters}")
         progress_bar = tqdm(range(iql_steps_per_iter), desc=f"Offline RL / IQL iter {it+1}/{offline_iters}")
 
@@ -486,7 +575,6 @@ def add_actor_information_and_train(
             training_infos.update(actor_output.get("actor_info", {}))
             if "ratio_mean" in actor_output:
                 training_infos["ratio_mean"] = actor_output["ratio_mean"].item()
-            training_infos["buffer_size"] = len(replay_buffer)
             training_infos["Training step"] = optimization_step + 1
 
             progress_bar.set_postfix(
@@ -546,16 +634,24 @@ def add_actor_information_and_train(
         
         # --------- OPE gate at end of iteration ----------
         logging.info("[OFFLINE] Evaluating policy with OPE (AM-Q)...")
-        cand_score, cand_frames = amq_score_from_buffer(replay_buffer)
+        # cand_score, cand_frames = amq_score_from_buffer(replay_buffer)
+        # Use online evaluation: sample from buffer and compute Q-values with current policy
+        ope_num_samples = getattr(cfg.offline, "ope_num_samples", min(5000, len(replay_buffer)))
+        cand_score, cand_frames, improvement, update_policy = amq_score_from_buffer_online(
+            buf=replay_buffer,
+            policy=policy,
+            num_samples=ope_num_samples,
+            adaptive_threshold_fraction=getattr(cfg.offline, "ope_adaptive_threshold_fraction", 0.05),
+        )
 
-        logging.info(f"[OFFLINE] OPE score: {cand_score:.2f}, frames: {cand_frames}, threshold: {ope_threshold}")
+        logging.info(f"[OFFLINE] OPE score: {cand_score:.2f}, samples: {cand_frames}, improvement: {improvement:.3f}, threshold_fraction: {ope_adaptive_threshold_fraction}")
 
         # Note: ope_min_episodes is now interpreted as minimum frames for acceptance gate
-        if cand_frames >= ope_min_episodes and (cand_score - accepted_policy_score) > ope_threshold:
+        if update_policy or ope_iterations >= max_ope_iterations:
+            ope_iterations = 0
+            
             # Accept and refresh reference score
-            logging.info(f"[OFFLINE] Policy accepted! Score improvement: {cand_score - accepted_policy_score:.2f}")
-            accepted_policy_score = cand_score
-            last_accept_step = optimization_step
+            logging.info(f"[OFFLINE] Policy accepted! Current Score: {cand_score:.2f}")
 
             # Merge offline dataset with SUCCESSFUL online episodes
             logging.info("[OFFLINE] Merging successful online episodes into offline buffer...")
@@ -563,12 +659,23 @@ def add_actor_information_and_train(
             offline_replay_buffer = merge_offline_online_success(
                 offline_buffer=offline_replay_buffer,
                 online_buffer=replay_buffer,
+                allowed_features=allowed_features,
+                task_name=cfg.env.task if cfg.env.task is not None else "Control robot to finish the task",
             )
+
             offline_iterator = offline_replay_buffer.get_iterator(
                 batch_size=batch_size, async_prefetch=async_prefetch, queue_size=2
             )
 
+            # Push parameters to actor server (atomic: before buffer reinit)
+            # Note: We put this before BC finetune for better stability of the training loop
+            push_actor_policy_to_queue(parameters_queue=parameters_queue, policy=policy)
+            logging.info("[OFFLINE] Pushed updated policy parameters to actor.")
+
             # --------- Optional BC finetune on merged buffer ---------
+            # if not has_successful_online_episodes:
+            #     logging.info("[OFFLINE] No successful online episodes found. Skipping BC finetune.")
+
             if bc_steps_after_merge > 0:
                 logging.info(f"[OFFLINE] Running BC finetune for {bc_steps_after_merge} steps...")
                 # Unfreeze encoder for BC stage (full-model BC)
@@ -579,7 +686,7 @@ def add_actor_information_and_train(
                 # Ensure actor encoder is trainable
                 policy._ensure_actor_encoder_trainable()
 
-                for bc_step in range(bc_steps_after_merge):
+                for bc_step in tqdm(range(bc_steps_after_merge), desc="BC finetune"):
                     bc_batch = next(offline_iterator)
                     bc_forward_batch = {
                         "action": bc_batch["action"],
@@ -602,9 +709,10 @@ def add_actor_information_and_train(
                             {
                                 "bc_loss": bc_out["loss_actor_bc"].item(),
                                 "bc_step": bc_step,
+                                "Optimization step": optimization_step,
                             },
                             mode="train",
-                            custom_step_key="Training step",
+                            custom_step_key="Optimization step",
                         )
 
                 # Reset encoder requires_grad to original value if it was set
@@ -623,13 +731,12 @@ def add_actor_information_and_train(
             policy.update_target_networks()
             logging.info("[OFFLINE] Target networks updated after BC.")
 
-            # Push parameters to actor server (atomic: before buffer reinit)
-            push_actor_policy_to_queue(parameters_queue=parameters_queue, policy=policy)
-            logging.info("[OFFLINE] Pushed updated policy parameters to actor.")
-
-            # Reinitialize online buffer (not just clear) to reset complementary_info layout
-            replay_buffer = initialize_replay_buffer(cfg, device, storage_device)
-            logging.info("[OFFLINE] Reinitialized online replay buffer.")
+            # Clear online buffer to start fresh for next iteration
+            # Note: We clear instead of recreating to maintain the same object reference.
+            # The actor connection is through transition_queue, not the buffer object itself,
+            # so clearing is safe and more efficient.
+            replay_buffer.clear()
+            logging.info("[OFFLINE] Cleared online replay buffer.")
 
             # Log acceptance metrics
             if wandb_logger is not None:
@@ -637,7 +744,8 @@ def add_actor_information_and_train(
                     {
                         "ope_score": cand_score,
                         "ope_frames": cand_frames,
-                        "accepted_policy_score": accepted_policy_score,
+                        "ope_improvement": improvement,
+                        "Optimization step": optimization_step,
                     },
                     mode="train",
                     custom_step_key="Optimization step",
@@ -647,7 +755,7 @@ def add_actor_information_and_train(
             # Reject candidate; keep collecting more online episodes into online_buffer
             logging.info(
                 f"[OFFLINE] Policy rejected (insufficient improvement or frames). "
-                f"Current: {cand_score:.2f}, Accepted: {accepted_policy_score:.2f}, "
+                f"Current: {cand_score:.2f}, Improvement: {improvement:.3f}, threshold_fraction: {ope_adaptive_threshold_fraction}"
                 f"Frames: {cand_frames}"
             )
 
