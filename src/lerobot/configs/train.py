@@ -189,9 +189,10 @@ class OfflineStageConfig:
     bc_steps_after_merge: int = 2000
     sync_critic_encoder_after_bc: bool = False # enforce sync critic encoder with actor encoder after BC finetuning
     success_keep_ratio: float = 1.0
-    ope_threshold: float = 0.02
-    ope_min_episodes: int = 10
+    ope_adaptive_threshold_fraction: float = 0.05
     pretrain_path: str | None = None
+    ope_num_samples: int = 5000 # number of samples to draw from the buffer for OPE
+    max_ope_iterations: int = 5 # after n iterations, the policy is accepted even if the improvement is less than the threshold
 
 
 @dataclass(kw_only=True)
