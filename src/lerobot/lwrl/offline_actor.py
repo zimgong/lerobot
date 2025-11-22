@@ -438,7 +438,7 @@ def act_with_policy(
             "q_min": q_min.cpu(),  # AM-Q
             "v": v.cpu(),  # optional diagnostics
             "adv": adv.cpu(),  # optional diagnostics
-            "success": info.get('is_success', torch.zeros_like(done, device=device, dtype=torch.bool)).to(torch.float32),
+            "is_success": info.get('is_success', torch.zeros_like(done, device=device, dtype=torch.bool)).to(torch.float32),
         }
             
         list_transition_to_send_to_learner.append(
