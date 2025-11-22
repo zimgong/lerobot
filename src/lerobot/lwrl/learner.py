@@ -1016,7 +1016,8 @@ def initialize_offline_replay_buffer(
     cfg: TrainRLServerPipelineConfig,
     device: str,
     storage_device: str,
-) -> ReplayBuffer:
+    return_features: bool = False,
+) -> ParallelReplayBuffer:
     """
     Initialize an offline replay buffer from a dataset.
 
@@ -1045,15 +1046,19 @@ def initialize_offline_replay_buffer(
 
 
     logging.info("Convert to a offline replay buffer")
-    offline_replay_buffer = ReplayBuffer.from_lerobot_dataset(
+    offline_replay_buffer = ParallelReplayBuffer.from_lerobot_dataset(
         offline_dataset,
         device=device,
         state_keys=cfg.policy.input_features.keys(),
         storage_device=storage_device,
         optimize_memory=True,
+        num_envs=1,
         capacity=cfg.policy.offline_buffer_capacity,
     )
-    return offline_replay_buffer
+    if return_features:
+        return offline_replay_buffer, offline_dataset.meta.info["features"]
+    else:
+        return offline_replay_buffer
 
 
 # Utilities/Helpers functions
