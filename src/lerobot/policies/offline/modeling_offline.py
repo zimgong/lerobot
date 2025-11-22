@@ -376,7 +376,18 @@ class OfflineIQLPolicy(PreTrainedPolicy):
             actions: Tensor = actions[:, :DISCRETE_DIMENSION_INDEX]
         
         dist, _ = self._actor_distribution(observations, observation_features)
-        log_prob = dist.log_prob(actions)
+        
+        # Clamp actions to valid distribution support to prevent NaN in inverse transforms
+        # This is necessary because actions from the buffer may be slightly outside bounds
+        # due to numerical precision or data collection issues.
+        # NOTE: Clamping preserves gradients w.r.t. distribution parameters (means, std)
+        # because log_prob(dist, clamped_actions) still depends on dist parameters.
+        # However, we use detach() on the clamping to ensure clean gradient flow.
+        actions_clamped = self._clamp_actions_to_support(actions)
+        
+        # Compute log_prob with clamped actions
+        # Gradients flow: log_prob -> dist parameters (means, std) -> actor network
+        log_prob = dist.log_prob(actions_clamped)
 
         with torch.no_grad():
             q_values = self.critic_ensemble(observations, actions, observation_features)
@@ -480,6 +491,76 @@ class OfflineIQLPolicy(PreTrainedPolicy):
     # --------------------------------------------------------------------- #
     # Utilities
     # --------------------------------------------------------------------- #
+    def _clamp_actions_to_support(
+        self, actions: Tensor
+    ) -> Tensor:
+        """Clamp actions to the valid distribution support to prevent NaN in inverse transforms.
+        
+        This ensures actions are within [low, high] bounds (if set) or [-1, 1] (if no bounds),
+        preventing numerical issues when computing log_prob through inverse transforms.
+        The clamping uses a small epsilon to avoid exact boundary values that could cause
+        numerical instability in atanh.
+        
+        IMPORTANT: Gradient flow is preserved because:
+        - Actions come from buffer (no gradients needed)
+        - log_prob(dist, clamped_actions) still depends on dist parameters (means, std)
+        - Gradients flow: log_prob -> dist parameters -> actor network
+        - Clamping only affects the evaluation point, not the gradient w.r.t. dist parameters
+        
+        Args:
+            actions: Actions tensor to clamp, shape [batch_size, action_dim] (from buffer, no gradients)
+            dist: The distribution with transform information (unused but kept for API consistency)
+            
+        Returns:
+            Clamped actions tensor with same shape as input
+        """
+        low = self.actor.action_low_bound
+        high = self.actor.action_high_bound
+        
+        if low is not None and high is not None:
+            # Convert bounds to tensors on the same device and dtype as actions
+            low_tensor = torch.as_tensor(low, device=actions.device, dtype=actions.dtype)
+            high_tensor = torch.as_tensor(high, device=actions.device, dtype=actions.dtype)
+            
+            # Handle different bound shapes
+            if low_tensor.dim() == 0:
+                # Scalar bounds: apply to all dimensions
+                eps = 1e-6
+                actions_clamped = torch.clamp(
+                    actions,
+                    min=low_tensor.item() + eps,
+                    max=high_tensor.item() - eps
+                )
+            elif low_tensor.dim() == 1:
+                # Per-dimension bounds: [action_dim]
+                # Expand to [batch_size, action_dim] for element-wise clamping
+                batch_size = actions.shape[0]
+                low_expanded = low_tensor.unsqueeze(0).expand(batch_size, -1)
+                high_expanded = high_tensor.unsqueeze(0).expand(batch_size, -1)
+                
+                # Clamp each dimension independently with epsilon to avoid boundary issues
+                eps = 1e-6
+                actions_clamped = torch.clamp(
+                    actions,
+                    min=low_expanded + eps,
+                    max=high_expanded - eps
+                )
+            else:
+                # Already in correct shape, use directly
+                eps = 1e-6
+                actions_clamped = torch.clamp(
+                    actions,
+                    min=low_tensor + eps,
+                    max=high_tensor - eps
+                )
+        else:
+            # No rescaling: actions should be in [-1, 1] after tanh
+            # Clamp to slightly inside [-1, 1] to avoid atanh(±1) = ±inf
+            eps = 1e-6
+            actions_clamped = torch.clamp(actions, min=-1.0 + eps, max=1.0 - eps)
+        
+        return actions_clamped
+
     def update_target_networks(self) -> None:
         tau = self.config.critic_target_update_weight
         for target_param, param in zip(self.critic_target.parameters(), self.critic_ensemble.parameters(), strict=True):
@@ -603,5 +684,5 @@ class OfflineIQLPolicy(PreTrainedPolicy):
         for param in self.actor.encoder.parameters():
             if not param.requires_grad:
                 # Enable grad for all encoder params during BC stage
-                print("BC Stage: enabling gradients for actor encoder parameters")
+                print(f"BC Stage: enabling gradients for actor encoder parameters {param.names}")
                 param.requires_grad_(True)
