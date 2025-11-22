@@ -204,6 +204,19 @@ class ParallelReplayBuffer:
 
         self.initialized = True
 
+    def clear(self) -> None:
+        """Clear all data from the buffer while keeping the same object.
+        
+        Resets position, size, and initialized flag. The storage tensors remain
+        allocated but are effectively empty. This is more efficient than recreating
+        the buffer and maintains object identity.
+        """
+        self.position.zero_()
+        self.size.zero_()
+        self.initialized = False
+        # Note: We don't clear the storage tensors themselves to avoid reallocation
+        # The buffer will be re-initialized on the next add() call
+
     def __len__(self):
         return self.size.sum().item()
 
@@ -717,10 +730,19 @@ class ParallelReplayBuffer:
         repo_id: str,
         fps=1,
         root=None,
-        task_name="from_parallel_replay_buffer",
+        task_name:str = "Control robot to finish the task",
+        allowed_features: dict | None = None,
     ) -> LeRobotDataset:
         """
         Converts all transitions in this ParallelReplayBuffer into a single LeRobotDataset object.
+        
+        Args:
+            repo_id: Repository ID for the dataset
+            fps: Frames per second
+            root: Root directory for the dataset
+            task_name: Name of the task
+            allowed_features: Optional dict of allowed features. If provided, only these features
+                will be included in the dataset. Must be a subset of available features.
         """
         total_size = self.size.sum().item()
         if total_size == 0:
@@ -758,6 +780,18 @@ class ParallelReplayBuffer:
                     sample_val = sample_val.unsqueeze(0)
                 f_info = guess_feature_info(t=sample_val, name=f"complementary_info.{key}")
                 features[f"complementary_info.{key}"] = f_info
+
+        # Filter features if allowed_features is provided
+        if allowed_features is not None:
+            # Check that all allowed_features exist in this buffer's features
+            missing_features = set(allowed_features.keys()) - set(features.keys())
+            if missing_features:
+                raise ValueError(
+                    f"Missing required features in buffer: {missing_features}. "
+                    f"Available features: {list(features.keys())}"
+                )
+            # Use only allowed features
+            features = {k: v for k, v in features.items() if k in allowed_features}
 
         # Create an empty LeRobotDataset
         lerobot_dataset = LeRobotDataset.create(
@@ -812,6 +846,17 @@ class ParallelReplayBuffer:
                         # Non-tensor values can be used directly
                         else:
                             frame_dict[f"complementary_info.{key}"] = val
+
+                # Filter frame_dict to only include allowed features if specified
+                # Note: Always preserve required metadata fields like "task" even if not in allowed_features
+                if allowed_features is not None:
+                    # Preserve required metadata fields that may not be in feature schema
+                    required_metadata_fields = {"task"}  # LeRobotDataset requires this field
+                    preserved_fields = {k: v for k, v in frame_dict.items() if k in required_metadata_fields}
+                    # Filter to only allowed features
+                    filtered_dict = {k: v for k, v in frame_dict.items() if k in allowed_features}
+                    # Merge preserved fields back
+                    frame_dict = {**filtered_dict, **preserved_fields}
 
                 # Check if this frame indicates success
                 if 'complementary_info.is_success' in frame_dict:

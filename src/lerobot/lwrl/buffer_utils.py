@@ -24,6 +24,7 @@ dataset buffer for iterative offline RL training.
 from __future__ import annotations
 
 import logging
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -36,32 +37,116 @@ from lerobot.lwrl.buffer_batched import ParallelReplayBuffer
 
 
 @torch.no_grad()
+def convert_buffer_to_dataset_with_features(
+    buffer: ParallelReplayBuffer,
+    repo_id: str,
+    root: str,
+    task_name: str,
+    allowed_features: dict,
+) -> LeRobotDataset:
+    """Convert a buffer to LeRobotDataset ensuring it follows the given features.
+    
+    Validates that the buffer has all required features from allowed_features,
+    and filters the dataset to only include those features. Any extra features
+    in the buffer will be discarded.
+    
+    Args:
+        buffer: ParallelReplayBuffer to convert
+        repo_id: Repository ID for the dataset
+        root: Root directory path for the dataset
+        task_name: Task name for the dataset
+        allowed_features: Dictionary of allowed features. Buffer must have all
+            these features, and will be filtered to only include them.
+    
+    Returns:
+        LeRobotDataset with filtered features matching allowed_features
+    
+    Raises:
+        ValueError: If buffer is missing any required features from allowed_features
+    """
+    # Validate buffer has all required features
+    # Get buffer's features by converting temporarily to check compatibility
+    temp_path = Path(root).parent / f"{repo_id}_temp_check"
+    temp_dataset = buffer.to_lerobot_dataset(
+        repo_id=f"{repo_id}_temp",
+        fps=1,
+        root=str(temp_path),
+        task_name=task_name,
+    )
+    buffer_features = temp_dataset.meta.info["features"]
+    
+    # Check that all allowed features exist in buffer
+    missing_features = set(allowed_features.keys()) - set(buffer_features.keys())
+    if missing_features:
+        raise ValueError(
+            f"Buffer is missing required features: {missing_features}. "
+            f"Buffer features: {list(buffer_features.keys())}. "
+            f"Required features: {list(allowed_features.keys())}"
+        )
+    
+    # Log extra features that will be discarded
+    extra_features = set(buffer_features.keys()) - set(allowed_features.keys())
+    if extra_features:
+        logging.info(f"Buffer has extra features that will be discarded: {extra_features}")
+    
+    # Clean up temp dataset
+    if temp_path.exists():
+        shutil.rmtree(temp_path, ignore_errors=True)
+    
+    # Convert buffer with feature filtering
+    dataset = buffer.to_lerobot_dataset(
+        repo_id=repo_id,
+        fps=1,
+        root=root,
+        task_name=task_name,
+        allowed_features=allowed_features,
+    )
+    
+    return dataset
+
+
+@torch.no_grad()
 def merge_offline_online_success(
     offline_buffer: ReplayBuffer | ParallelReplayBuffer,
     online_buffer: ReplayBuffer | ParallelReplayBuffer,
+    allowed_features: dict,
+    task_name:str = "Control robot to finish the task",
 ) -> ReplayBuffer | ParallelReplayBuffer:
     """Merge offline buffer with successful online episodes.
 
     Creates a new replay buffer containing all offline transitions plus
     successful transitions from the online buffer. Both buffers are filtered
-    to only include successful episodes before merging.
+    to only include successful episodes before merging. Offline buffer must have successful episodes.
+
+    Task name is used to create the merged dataset.
+    
+    The allowed_features are used as the reference. Online buffer must have
+    all required features, and any extra features in online buffer will be discarded.
 
     Args:
         offline_buffer: Existing offline replay buffer (must be ParallelReplayBuffer)
         online_buffer: Online replay buffer with collected episodes (must be ParallelReplayBuffer)
-
+        allowed_features: Dictionary of allowed features from offline dataset. Online buffer
+            will be filtered to only include these features.
+        task_name: Task name for the merged dataset.
     Returns:
         New merged replay buffer containing successful episodes from both buffers
     """
-    if not isinstance(offline_buffer, ParallelReplayBuffer):
+    if not isinstance(offline_buffer, ParallelReplayBuffer) or not isinstance(online_buffer, ParallelReplayBuffer):
         raise NotImplementedError("Merging offline and online buffers is not supported for ReplayBuffer.")
     
-    if not isinstance(online_buffer, ParallelReplayBuffer):
-        raise NotImplementedError("Merging offline and online buffers is not supported for ReplayBuffer.")
+    # Check successful episodes count before converting to avoid unnecessary work
+    offline_success_count = offline_buffer._success_episode_num() if len(offline_buffer) > 0 else 0
+    online_success_count = online_buffer._success_episode_num() if len(online_buffer) > 0 else 0
+
+    assert offline_success_count > 0, "Offline buffer must have successful episodes."
     
-    # Check if buffers are empty
-    if len(offline_buffer) == 0 and len(online_buffer) == 0:
-        raise ValueError("Both buffers are empty. Cannot merge.")
+    if offline_success_count > 0 and online_success_count == 0:
+        logging.info("No successful online episodes. Using offline buffer directly.")
+        return offline_buffer
+    
+    logging.info(f"Successful episodes - Offline: {offline_success_count}, Online: {online_success_count}")
+    logging.info(f"Using allowed features: {list(allowed_features.keys())}")
     
     # Collect datasets to merge (handle empty buffers)
     datasets_to_merge = []
@@ -71,51 +156,47 @@ def merge_offline_online_success(
     # complementary_info.is_success == 1.0 in at least one frame per episode.
     # Only episodes with at least one successful frame are included in the dataset.
     with tempfile.TemporaryDirectory() as tmpdir:
-        # Convert offline buffer if not empty
-        if len(offline_buffer) > 0:
-            offline_dataset_path = Path(tmpdir) / "offline_dataset"
-            offline_dataset_path.mkdir(parents=True, exist_ok=True)
-            
-            offline_dataset = offline_buffer.to_lerobot_dataset(
-                repo_id="offline_buffer",
-                fps=1,
-                root=str(offline_dataset_path),
-                task_name="offline",
-            )
-            
-            logging.info(f"Offline dataset: {offline_dataset.meta.total_episodes} episodes, {offline_dataset.meta.total_frames} frames")
-            datasets_to_merge.append(offline_dataset)
-        
-        # Convert online buffer if not empty
-        if len(online_buffer) > 0:
+        # Convert online buffer if it has successful episodes
+        if online_success_count > 0:
             online_dataset_path = Path(tmpdir) / "online_dataset"
-            online_dataset_path.mkdir(parents=True, exist_ok=True)
-            
-            online_dataset = online_buffer.to_lerobot_dataset(
+            online_dataset = convert_buffer_to_dataset_with_features(
+                buffer=online_buffer,
                 repo_id="online_buffer",
-                fps=1,
                 root=str(online_dataset_path),
-                task_name="online",
+                task_name=task_name,
+                allowed_features=allowed_features,
             )
-            
             logging.info(f"Online dataset: {online_dataset.meta.total_episodes} episodes, {online_dataset.meta.total_frames} frames")
             datasets_to_merge.append(online_dataset)
-        
-        # If only one buffer had data, use it directly
-        if len(datasets_to_merge) == 1:
-            merged_dataset = datasets_to_merge[0]
-            logging.info(f"Only one buffer had successful episodes. Using that dataset directly.")
         else:
-            # Merge the datasets
-            logging.info("Merging datasets...")
-            merged_dataset_path = Path(tmpdir) / "merged_dataset"
-            merged_dataset_path.mkdir(parents=True, exist_ok=True)
-            
-            merged_dataset = merge_datasets(
-                datasets=datasets_to_merge,
-                output_repo_id="merged_buffer",
-                output_dir=str(merged_dataset_path),
+            logging.info("Skipping online buffer conversion (no successful episodes)")
+        
+        # Convert offline buffer if it has successful episodes
+        if offline_success_count > 0:
+            offline_dataset_path = Path(tmpdir) / "offline_dataset"
+            offline_dataset = convert_buffer_to_dataset_with_features(
+                buffer=offline_buffer,
+                repo_id="offline_buffer",
+                root=str(offline_dataset_path),
+                task_name=task_name,
+                allowed_features=allowed_features,
             )
+            logging.info(f"Offline dataset: {offline_dataset.meta.total_episodes} episodes, {offline_dataset.meta.total_frames} frames")
+            datasets_to_merge.append(offline_dataset)
+        else:
+            logging.info("Skipping offline buffer conversion (no successful episodes)")        
+
+        # Handle merging based on available datasets
+        # Merge the datasets
+        logging.info("Merging datasets...")
+        merged_dataset_path = Path(tmpdir) / "merged_dataset"
+        # Don't create directory - merge_datasets() will create it internally
+        
+        merged_dataset = merge_datasets(
+            datasets=datasets_to_merge,
+            output_repo_id="merged_buffer",
+            output_dir=str(merged_dataset_path),
+        )
         
         logging.info(f"Merged dataset: {merged_dataset.meta.total_episodes} episodes, {merged_dataset.meta.total_frames} frames")
         
