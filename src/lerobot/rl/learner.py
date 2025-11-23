@@ -48,7 +48,6 @@ import logging
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
 from pathlib import Path
 from pprint import pformat
 from typing import Any
@@ -61,6 +60,7 @@ from torch import nn
 from torch.multiprocessing import Queue
 from torch.nn.parallel import DistributedDataParallel
 from torch.optim.optimizer import Optimizer
+from accelerate import PartialState
 
 from lerobot.cameras import opencv  # noqa: F401
 from lerobot.configs import parser
@@ -89,6 +89,7 @@ from lerobot.utils.constants import (
     PRETRAINED_MODEL_DIR,
     TRAINING_STATE_DIR,
 )
+from lerobot.utils.dist_utils import init_dist
 from lerobot.utils.random_utils import set_seed
 from lerobot.utils.train_utils import (
     get_step_checkpoint_dir,
@@ -104,20 +105,6 @@ from lerobot.utils.utils import (
 )
 
 from lerobot.rl.learner_service import MAX_WORKERS, SHUTDOWN_TIMEOUT, LearnerService
-
-
-@dataclass(slots=True)
-class DistributedContext:
-    enabled: bool = False
-    rank: int = 0
-    world_size: int = 1
-    local_rank: int = 0
-    device: torch.device | None = None
-    backend: str | None = None
-
-    @property
-    def is_main_process(self) -> bool:
-        return self.rank == 0
 
 
 @parser.wrap()
@@ -136,52 +123,6 @@ def train_cli(cfg: TrainRLServerPipelineConfig):
     logging.info("[LEARNER] train_cli finished")
 
 
-def setup_distributed(cfg: TrainRLServerPipelineConfig) -> DistributedContext:
-    world_size_env = int(os.environ.get("WORLD_SIZE", "1"))
-    backend = os.environ.get("TORCH_DISTRIBUTED_BACKEND")
-
-    if world_size_env <= 1:
-        device = get_safe_torch_device(try_device=cfg.policy.device, log=True)
-        return DistributedContext(
-            enabled=False,
-            rank=0,
-            world_size=1,
-            local_rank=0,
-            device=device,
-            backend=None,
-        )
-
-    if not dist.is_available():
-        raise RuntimeError(
-            "torch.distributed is not available but distributed execution was requested (WORLD_SIZE > 1)."
-        )
-
-    if backend is None:
-        backend = "nccl" if torch.cuda.is_available() else "gloo"
-
-    if not dist.is_initialized():
-        dist.init_process_group(backend=backend)
-
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    local_rank = int(os.environ.get("LOCAL_RANK", rank))
-
-    if torch.cuda.is_available():
-        torch.cuda.set_device(local_rank)
-        device = torch.device(f"cuda:{local_rank}")
-    else:
-        device = get_safe_torch_device(try_device=cfg.policy.device, log=True)
-
-    return DistributedContext(
-        enabled=True,
-        rank=rank,
-        world_size=world_size,
-        local_rank=local_rank,
-        device=device,
-        backend=backend,
-    )
-
-
 def train(cfg: TrainRLServerPipelineConfig, job_name: str | None = None):
     """
     Main training function that initializes and runs the training process.
@@ -193,9 +134,11 @@ def train(cfg: TrainRLServerPipelineConfig, job_name: str | None = None):
 
     cfg.validate()
 
-    dist_ctx = setup_distributed(cfg)
-    if dist_ctx.device is not None:
-        cfg.policy.device = str(dist_ctx.device)
+    init_dist(launcher="pytorch", backend="nccl")
+    distributed_state = PartialState()
+
+    if distributed_state.device is not None:
+        cfg.policy.device = str(distributed_state.device)
 
     if job_name is None:
         job_name = cfg.job_name
@@ -218,7 +161,7 @@ def train(cfg: TrainRLServerPipelineConfig, job_name: str | None = None):
     logging.info(pformat(cfg.to_dict()))
 
     # Setup WandB logging if enabled
-    if cfg.wandb.enable and cfg.wandb.project and dist_ctx.is_main_process:
+    if cfg.wandb.enable and cfg.wandb.project and distributed_state.is_main_process:
         from lerobot.rl.wandb_utils import WandBLogger
 
         wandb_logger = WandBLogger(cfg)
@@ -241,7 +184,7 @@ def train(cfg: TrainRLServerPipelineConfig, job_name: str | None = None):
         cfg=cfg,
         wandb_logger=wandb_logger,
         shutdown_event=shutdown_event,
-        dist_ctx=dist_ctx,
+        distributed_state=distributed_state,
     )
 
 
@@ -249,7 +192,7 @@ def start_learner_threads(
     cfg: TrainRLServerPipelineConfig,
     wandb_logger: WandBLogger | None,
     shutdown_event: any,  # Event,
-    dist_ctx: DistributedContext | None = None,
+    distributed_state: PartialState,
 ) -> None:
     """
     Start the learner threads for training.
@@ -258,10 +201,10 @@ def start_learner_threads(
         cfg (TrainRLServerPipelineConfig): Training configuration
         wandb_logger (WandBLogger | None): Logger for metrics
         shutdown_event: Event to signal shutdown
-        dist_ctx (DistributedContext | None): Distributed context
+        distributed_state (PartialState): Distributed state from accelerate
     """
     # Create multiprocessing queues
-    is_main_rank = not dist_ctx.enabled or dist_ctx.is_main_process
+    is_main_rank = not distributed_state.use_distributed or distributed_state.is_main_process
     transition_queue = Queue() if is_main_rank else None
     interaction_message_queue = Queue() if is_main_rank else None
     parameters_queue = Queue() if is_main_rank else None
@@ -300,7 +243,7 @@ def start_learner_threads(
         transition_queue=transition_queue,
         interaction_message_queue=interaction_message_queue,
         parameters_queue=parameters_queue,
-        dist_ctx=dist_ctx,
+        distributed_state=distributed_state,
     )
     logging.info("[LEARNER] Training process stopped")
 
@@ -333,7 +276,7 @@ def add_actor_information_and_train(
     transition_queue: Queue,
     interaction_message_queue: Queue,
     parameters_queue: Queue,
-    dist_ctx: DistributedContext | None = None,
+    distributed_state: PartialState,
 ):
     """
     Handles data transfer from the actor to the learner, manages training updates,
@@ -358,14 +301,14 @@ def add_actor_information_and_train(
         transition_queue (Queue): Queue for receiving transitions from the actor.
         interaction_message_queue (Queue): Queue for receiving interaction messages from the actor.
         parameters_queue (Queue): Queue for sending policy parameters to the actor.
-        dist_ctx (DistributedContext | None): Distributed context
+        distributed_state (PartialState): Distributed state from accelerate
     """
     # Extract configuration variables at the beginning to improve
     # speed (approx. 7% gain in profiling)
-    distributed = dist_ctx.enabled
-    is_main_rank = not distributed or dist_ctx.is_main_process
+    distributed = distributed_state.use_distributed
+    is_main_rank = not distributed or distributed_state.is_main_process
 
-    device = dist_ctx.device if dist_ctx.device is not None else get_safe_torch_device(
+    device = distributed_state.device if distributed_state.device is not None else get_safe_torch_device(
         try_device=cfg.policy.device, log=True
     )
     storage_device = get_safe_torch_device(try_device=cfg.policy.storage_device)
@@ -451,7 +394,7 @@ def add_actor_information_and_train(
     if distributed and not is_main_rank:
         dist.barrier()
     replay_buffer = initialize_replay_buffer(
-        cfg, device, storage_device, observation_preprocessor, dist_ctx
+        cfg, device, storage_device, observation_preprocessor, distributed_state
     )
     if distributed and is_main_rank:
         dist.barrier()
@@ -484,29 +427,29 @@ def add_actor_information_and_train(
     while True:
         # Exit the training loop if shutdown is requested
         # if distributed:
-        #     print(f"Learner rank {dist_ctx.rank} broadcasting flag")
+        #     print(f"Learner rank {distributed_state.process_index} broadcasting flag")
         #     should_exit = broadcast_flag(
         #         1 if (is_main_rank and shutdown_event is not None and shutdown_event.is_set()) else 0,
-        #         dist_ctx=dist_ctx,
+        #         distributed_state=distributed_state,
         #         device=device,
         #     )
-        #     print(f"Learner rank {dist_ctx.rank} should exit: {should_exit}")
+        #     print(f"Learner rank {distributed_state.process_index} should exit: {should_exit}")
         #     if should_exit:
         #         if is_main_rank:
         #             logging.info("[LEARNER] Shutdown signal received. Exiting...")
         #         if replay_buffer.shared_memory_manager:
-        #             replay_buffer.shared_memory_manager.cleanup(dist_ctx.rank)
+        #             replay_buffer.shared_memory_manager.cleanup(distributed_state.process_index)
         #         if offline_replay_buffer.shared_memory_manager:
-        #             offline_replay_buffer.shared_memory_manager.cleanup(dist_ctx.rank)
+        #             offline_replay_buffer.shared_memory_manager.cleanup(distributed_state.process_index)
         #         break
         # else:
         if shutdown_event is not None and shutdown_event.is_set():
             logging.info("[LEARNER] Shutdown signal received. Exiting...")
             if distributed:
                 if replay_buffer.shared_memory_manager:
-                    replay_buffer.shared_memory_manager.cleanup(dist_ctx.rank)
+                    replay_buffer.shared_memory_manager.cleanup(distributed_state.process_index)
                 if offline_replay_buffer.shared_memory_manager:
-                    offline_replay_buffer.shared_memory_manager.cleanup(dist_ctx.rank)
+                    offline_replay_buffer.shared_memory_manager.cleanup(distributed_state.process_index)
                 try:
                     dist.destroy_process_group()
                     logging.info("[LEARNER] Destroyed distributed process group.")
@@ -1128,7 +1071,7 @@ def log_training_info(cfg: TrainRLServerPipelineConfig, policy: nn.Module) -> No
 
 
 def initialize_replay_buffer(
-    cfg: TrainRLServerPipelineConfig, device: str, storage_device: str, preprocessor: None, dist_ctx: DistributedContext
+    cfg: TrainRLServerPipelineConfig, device: str, storage_device: str, preprocessor: None, distributed_state: PartialState
 ) -> ReplayBuffer:
     """
     Initialize a replay buffer, either empty or from a dataset if resuming.
@@ -1138,7 +1081,7 @@ def initialize_replay_buffer(
         device (str): Device to store tensors on
         storage_device (str): Device for storage optimization
         preprocessor: Optional preprocessor for observations
-        dist_ctx (DistributedContext | None): Distributed context for multi-GPU training
+        distributed_state (PartialState): Distributed state for multi-GPU training
 
     Returns:
         ReplayBuffer: Initialized replay buffer
@@ -1223,16 +1166,16 @@ def initialize_offline_replay_buffer(
 
 
 # Utilities/Helpers functions
-def broadcast_flag(value: int, dist_ctx: DistributedContext, device: torch.device) -> int:
-    if not dist_ctx.enabled:
+def broadcast_flag(value: int, distributed_state: PartialState, device: torch.device) -> int:
+    if not distributed_state.use_distributed:
         return value
 
-    # Use the device from dist_ctx which is the correct device for this rank
+    # Use the device from distributed_state which is the correct device for this rank
     # For NCCL backend, this will be the local CUDA device (e.g., cuda:0, cuda:1)
     # For gloo backend, this will be CPU
-    broadcast_device = dist_ctx.device if dist_ctx.device is not None else device
+    broadcast_device = distributed_state.device if distributed_state.device is not None else device
     
-    if dist_ctx.is_main_process:
+    if distributed_state.is_main_process:
         tensor = torch.tensor([value], dtype=torch.uint8, device=broadcast_device)
     else:
         tensor = torch.zeros(1, dtype=torch.uint8, device=broadcast_device)

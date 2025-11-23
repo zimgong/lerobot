@@ -696,16 +696,15 @@ class SACObservationEncoder(nn.Module):
                 return_dict=None,
                 labels=obs["labels"],
             )
-            vlm_outputs.attention_mask = obs["attention_mask"]
+            attention_mask = obs["attention_mask"]
             if detach:
-                vlm_outputs.attention_mask = vlm_outputs.attention_mask.detach()
                 if hasattr(vlm_outputs, "past_key_values"):
                     vlm_outputs.past_key_values = tuple(
                         (past_key_value[0].detach(), past_key_value[1].detach())
                         for past_key_value in vlm_outputs.past_key_values
                     )
 
-        return {"vlm_outputs": vlm_outputs}
+        return {"vlm_outputs": vlm_outputs, "attention_mask": attention_mask}
 
     def _encode_images(self, cache: dict[str, Tensor], detach: bool) -> Tensor:
         """Encode image features from cached observations.
@@ -723,7 +722,7 @@ class SACObservationEncoder(nn.Module):
             Tensor: The encoded image features.
         """
         vlm_outputs = cache['vlm_outputs']
-        attention_mask = vlm_outputs.attention_mask
+        attention_mask = cache['attention_mask']
         last_layer_kv = vlm_outputs.past_key_values[-1]
         last_key, last_value = last_layer_kv
 
@@ -743,7 +742,7 @@ class SACObservationEncoder(nn.Module):
         if detach:
             vlm_features = vlm_features.detach()
 
-        return {"vlm_outputs": vlm_outputs, "vlm_features": vlm_features}
+        return {"vlm_outputs": vlm_outputs, "vlm_features": vlm_features, "attention_mask": attention_mask}
 
     @property
     def output_dim(self) -> int:
@@ -924,7 +923,7 @@ class Policy(nn.Module):
         # We detach the encoder if it is shared to avoid backprop through it
         # This is important to avoid the encoder to be updated through the policy
         obs_enc = self.encoder(observations, cache=observation_features, detach=self.encoder_is_shared)
-        attention_mask = obs_enc['vlm_outputs'].attention_mask
+        attention_mask = obs_enc['attention_mask']
 
         # Get network outputs
         state = observations[OBS_STATE].to(dtype=self.network.dtype).unsqueeze(1)
