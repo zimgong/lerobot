@@ -732,6 +732,7 @@ class ParallelReplayBuffer:
         root=None,
         task_name:str = "Control robot to finish the task",
         allowed_features: dict | None = None,
+        max_episodes: int = -1,
     ) -> LeRobotDataset:
         """
         Converts all transitions in this ParallelReplayBuffer into a single LeRobotDataset object.
@@ -876,6 +877,10 @@ class ParallelReplayBuffer:
                             global_frame_idx += 1
                         lerobot_dataset.save_episode()
                         episode_idx += 1
+                        if max_episodes > 0 and episode_idx >= max_episodes:
+                            lerobot_dataset.stop_image_writer()
+                            lerobot_dataset.finalize()
+                            return lerobot_dataset
                         print(f"Saved successful episode {episode_idx} with {len(current_episode_frames)} frames")
                     
                     # Reset for next episode

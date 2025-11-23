@@ -278,14 +278,15 @@ def add_actor_information_and_train(
     ope_adaptive_threshold_fraction = cfg.offline.ope_adaptive_threshold_fraction
     max_ope_iterations = cfg.offline.max_ope_iterations
     ope_iterations = 0
+    max_online_episodes_added_per_iter = cfg.offline.max_online_episodes_added_per_iter
 
-    # # load pretrain manually (not resume since it will corrupt logging)
-    # if cfg.offline.pretrain_path is not None:
-    #     # might cause error if the policy is not compatible with the current config
-    #     import pickle as pkl
-    #     logging.info(f"Loading pretrain from {cfg.offline.pretrain_path} manually. Need to be replaced by resume logic in the future.")
-    #     policy: CurrentPolicy = pkl.load(open(cfg.offline.pretrain_path, "rb"))
-    #     policy.to(device)
+
+    # build ope eval env
+    ope_eval_env_cfg = cfg.ope_eval_env
+    assert ope_eval_env_cfg.type == "lwlab", "LwLab environment must be provided"
+    from lerobot.lwrl.sim.lwlab.env_lwlab import make_lwlab_robot_env, make_lwlab_processors
+    ope_eval_env, ope_eval_teleop_device = make_lwlab_robot_env(cfg=ope_eval_env_cfg)
+    ope_eval_env_processor, ope_eval_action_processor = make_lwlab_processors(env=ope_eval_env, teleop_device=ope_eval_teleop_device, cfg=ope_eval_env_cfg, device=device)
 
     # Initialize logging for multiprocessing
     if not use_threads(cfg):
@@ -644,6 +645,9 @@ def add_actor_information_and_train(
             cfg=cfg,
             num_samples=ope_num_samples,
             adaptive_threshold_fraction=getattr(cfg.offline, "ope_adaptive_threshold_fraction", 0.05),
+            online_env=ope_eval_env,
+            online_env_processor=ope_eval_env_processor,
+            online_action_processor=ope_eval_action_processor,
         )
 
         logging.info(f"[OFFLINE] OPE score: {cand_score:.2f}, samples: {cand_frames}, improvement: {improvement:.3f}, threshold_fraction: {ope_adaptive_threshold_fraction}")
@@ -663,6 +667,7 @@ def add_actor_information_and_train(
                 online_buffer=replay_buffer,
                 allowed_features=allowed_features,
                 task_name=cfg.env.task if cfg.env.task is not None else "Control robot to finish the task",
+                max_episodes=max_online_episodes_added_per_iter,
             )
 
             offline_iterator = offline_replay_buffer.get_iterator(
@@ -716,6 +721,24 @@ def add_actor_information_and_train(
                             mode="train",
                             custom_step_key="Optimization step",
                         )
+
+                    # Process all available transitions to the replay buffer, send by the actor server
+                    process_transitions(
+                        transition_queue=transition_queue,
+                        replay_buffer=replay_buffer,
+                        offline_replay_buffer=offline_replay_buffer,
+                        device=storage_device,
+                        dataset_repo_id=dataset_repo_id,
+                        shutdown_event=shutdown_event,
+                    )
+
+                    # Process all available interaction messages sent by the actor server
+                    interaction_message = process_interaction_messages(
+                        interaction_message_queue=interaction_message_queue,
+                        interaction_step_shift=interaction_step_shift,
+                        wandb_logger=wandb_logger,
+                        shutdown_event=shutdown_event,
+                    )
 
                 # Reset encoder requires_grad to original value if it was set
                 if original_encoder_requires_grad is not None:

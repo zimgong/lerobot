@@ -32,7 +32,9 @@
         "ope_adaptive_threshold_fraction": 0.05,
         "max_ope_iterations": 5,
         "pretrain_path": "/home/johndoe/Documents/lerobot-hilserl/outputs/train/2025-11-09/10-24-39_lwlab_lerobot_pickup_280episodes_offline_warmup/checkpoints/050000/policy_50000.pkl", 
-        "ope_num_samples": 5000
+        "ope_num_samples": 5000,
+
+        "max_online_episodes_added_per_iter": 50
     },
     "policy": {
         "type": "offline",

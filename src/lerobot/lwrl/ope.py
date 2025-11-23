@@ -204,6 +204,9 @@ def amq_score_from_buffer_online(
     cfg: TrainRLServerPipelineConfig,
     num_samples: int,
     adaptive_threshold_fraction: float = 0.05,
+    online_env = None,
+    online_env_processor = None,
+    online_action_processor = None,
 ) -> tuple[float, int]:
     """Compute AM-Q score by sampling from buffer and evaluating with current policy.
     
@@ -273,11 +276,16 @@ def amq_score_from_buffer_online(
     assert env_cfg.type == "lwlab", "LwLab environment must be provided"
     device = get_safe_torch_device(cfg.learner_device, log=True)
     
-    online_env, teleop_device = make_lwlab_robot_env(cfg=env_cfg)
-    env_processor, action_processor = make_lwlab_processors(online_env, teleop_device, env_cfg, device)
+    if online_env is None:
+        online_env, teleop_device = make_lwlab_robot_env(cfg=env_cfg)
+        env_processor, action_processor = make_lwlab_processors(online_env, teleop_device, env_cfg, device)
+    else:
+        assert online_env_processor is not None and online_action_processor is not None, "Env processor and action processor must be provided"
+        env_processor = online_env_processor
+        action_processor = online_action_processor
     obs, info = online_env.reset()
     env_processor.reset()
-    action_processor.reset()
+    action_processor.reset()    
 
     # Process initial observation
     transition = create_transition(

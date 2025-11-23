@@ -43,6 +43,7 @@ def convert_buffer_to_dataset_with_features(
     root: str,
     task_name: str,
     allowed_features: dict,
+    max_episodes: int = -1,
 ) -> LeRobotDataset:
     """Convert a buffer to LeRobotDataset ensuring it follows the given features.
     
@@ -72,6 +73,7 @@ def convert_buffer_to_dataset_with_features(
         fps=1,
         root=str(temp_path),
         task_name=task_name,
+        max_episodes=max_episodes,
     )
     buffer_features = temp_dataset.meta.info["features"]
     
@@ -111,6 +113,7 @@ def merge_offline_online_success(
     online_buffer: ReplayBuffer | ParallelReplayBuffer,
     allowed_features: dict,
     task_name:str = "Control robot to finish the task",
+    max_episodes: int = -1,
 ) -> ReplayBuffer | ParallelReplayBuffer:
     """Merge offline buffer with successful online episodes.
 
@@ -165,6 +168,7 @@ def merge_offline_online_success(
                 root=str(online_dataset_path),
                 task_name=task_name,
                 allowed_features=allowed_features,
+                max_episodes=max_episodes,
             )
             logging.info(f"Online dataset: {online_dataset.meta.total_episodes} episodes, {online_dataset.meta.total_frames} frames")
             datasets_to_merge.append(online_dataset)

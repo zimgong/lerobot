@@ -193,7 +193,7 @@ class OfflineStageConfig:
     pretrain_path: str | None = None
     ope_num_samples: int = 5000 # number of samples to draw from the buffer for OPE
     max_ope_iterations: int = 5 # after n iterations, the policy is accepted even if the improvement is less than the threshold
-
+    max_online_episodes_added_per_iter: int = 50 # maximum number of online episodes to add to the offline buffer per iteration
 
 @dataclass(kw_only=True)
 class TrainRLServerPipelineConfig(TrainPipelineConfig):
