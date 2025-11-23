@@ -1,6 +1,6 @@
 {    
     "output_dir": null,
-    "job_name": "lwlab_lerobot_pickup_280episodes_offline_rl_online_buffer",
+    "job_name": "lwlab_lerobot_pickup_280episodes_offline_rl_online_ope",
     "resume": false,
     "resume_from_output_dir": "/home/johndoe/Documents/lerobot-hilserl/outputs/train/2025-11-09/10-24-39_lwlab_lerobot_pickup_280episodes_offline_warmup",
     "seed": 1000,
@@ -10,6 +10,8 @@
     "log_freq": 1,
     "save_checkpoint": true,
     "save_freq": 2500,
+    "actor_device": "cuda:1",
+    "learner_device": "cuda:1",
     "wandb": {
         "enable": true,
         "mode": "online",
@@ -22,7 +24,7 @@
         "use_imagenet_stats": false
     },
     "offline": {
-        "iters": 100,
+        "iters": 300,
         "iql_steps": 1000,
         "bc_steps_after_merge": 1000,
         "sync_critic_encoder_after_bc": false,
@@ -30,7 +32,7 @@
         "ope_adaptive_threshold_fraction": 0.05,
         "max_ope_iterations": 5,
         "pretrain_path": "/home/johndoe/Documents/lerobot-hilserl/outputs/train/2025-11-09/10-24-39_lwlab_lerobot_pickup_280episodes_offline_warmup/checkpoints/050000/policy_50000.pkl", 
-        "ope_num_samples": 10000
+        "ope_num_samples": 5000
     },
     "policy": {
         "type": "offline",
@@ -329,7 +331,59 @@
         "type": "lwlab",
         "name": "lwlab_sim",
         "task": "lerobot_liftobj_visual_hilserl",
-        "num_envs": 100,
+        "num_envs": 20,
+        "fps": 10,
+        "robot": null,
+        "teleop": null,
+        "processor": {
+            "ENV_STATE_KEYS": ["joint_pos", "target_qpos", "delta_reset_qpos"],
+            "OBS_STATE_KEYS": ["joint_pos", "target_qpos", "delta_reset_qpos"],
+            "CAMERA_KEYS": ["image_global"],
+
+            "control_mode": "gamepad",
+            "reset": {
+                "fixed_reset_joint_positions": null,
+                "reset_time_s": 2.0,
+                "control_time_s": 15.0,
+                "terminate_on_success": true
+            }
+        },
+        "features": {
+            "observation.images.image_global": {
+                "type": "VISUAL",
+                "shape": [
+                    3,
+                    128,
+                    128
+                ]
+            },
+            "observation.state": {
+                "type": "STATE",
+                "shape": [
+                    17
+                ]
+            },
+            "action": {
+                "type": "ACTION",
+                "shape": [
+                    6
+                ]
+            }
+        },
+        "features_map": {
+            "observation.images.image_global": "observation.images.image_global",
+            "observation.state": "observation.state",
+            "action": "action"
+        }
+    },
+    "ope_eval_env": {
+        "type": "lwlab",
+        "name": "lwlab_sim",
+        "task": "lerobot_liftobj_visual_hilserl",
+        "address": "0.0.0.0",
+        "port": 50001,
+        "authkey": "lightwheel",
+        "num_envs": 20,
         "fps": 10,
         "robot": null,
         "teleop": null,

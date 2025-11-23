@@ -200,3 +200,9 @@ class TrainRLServerPipelineConfig(TrainPipelineConfig):
     dataset: DatasetConfig | None = None  # NOTE: In RL, we don't need an offline dataset
     resume_from_output_dir: Path | None = None
     offline: OfflineStageConfig = field(default_factory=OfflineStageConfig)
+    
+    ope_eval_env: envs.EnvConfig | None = None
+
+    # device
+    actor_device: str = "cuda"
+    learner_device: str = "cuda"

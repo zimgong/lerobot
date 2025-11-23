@@ -275,7 +275,7 @@ def act_with_policy(
         env_processor, action_processor = make_processors(online_env, teleop_device, cfg.env, cfg.policy.device)
 
     set_seed(cfg.seed)
-    device = get_safe_torch_device(cfg.policy.device, log=True)
+    device = get_safe_torch_device(cfg.actor_device, log=True)
 
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -299,9 +299,9 @@ def act_with_policy(
     # Process initial observation
     transition = create_transition(
         observation=obs,
-        reward=torch.zeros((online_env.num_envs,), dtype=torch.float32, device=online_env.device),
-        done=torch.zeros((online_env.num_envs,), dtype=torch.bool, device=online_env.device),
-        truncated=torch.zeros((online_env.num_envs,), dtype=torch.bool, device=online_env.device),
+        reward=torch.zeros((online_env.num_envs,), dtype=torch.float32, device=device),
+        done=torch.zeros((online_env.num_envs,), dtype=torch.bool, device=device),
+        truncated=torch.zeros((online_env.num_envs,), dtype=torch.bool, device=device),
         info=info)
     transition = env_processor(transition)
 

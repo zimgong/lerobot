@@ -60,7 +60,7 @@ from lerobot.utils.utils import (
 
 from lerobot.rl.learner_service import MAX_WORKERS, SHUTDOWN_TIMEOUT, LearnerService
 from lerobot.lwrl.buffer_batched import ParallelReplayBuffer
-from lerobot.lwrl.ope import amq_score_from_buffer, amq_score_from_buffer_online
+from lerobot.lwrl.ope import amq_score_from_buffer, amq_score_from_buffer_sample, amq_score_from_buffer_online
 from lerobot.lwrl.buffer_utils import merge_offline_online_success
 
 # Import functions called BY add_actor_information_and_train from learner.py
@@ -260,7 +260,7 @@ def add_actor_information_and_train(
     """
     # Extract all configuration variables at the beginning, it improve the speed performance
     # of 7%
-    device = get_safe_torch_device(try_device=cfg.policy.device, log=True)
+    device = get_safe_torch_device(try_device=cfg.learner_device, log=True)
     storage_device = get_safe_torch_device(try_device=cfg.policy.storage_device)
     clip_grad_norm_value = cfg.policy.grad_clip_norm
     fps = cfg.env.fps
@@ -297,6 +297,7 @@ def add_actor_information_and_train(
 
     logging.info("Initializing policy")
 
+    cfg.policy.device = cfg.learner_device # override for offline training
     policy: CurrentPolicy = make_policy(
         cfg=cfg.policy,
         env_cfg=cfg.env,
@@ -640,6 +641,7 @@ def add_actor_information_and_train(
         cand_score, cand_frames, improvement, update_policy = amq_score_from_buffer_online(
             buf=replay_buffer,
             policy=policy,
+            cfg=cfg,
             num_samples=ope_num_samples,
             adaptive_threshold_fraction=getattr(cfg.offline, "ope_adaptive_threshold_fraction", 0.05),
         )
