@@ -383,7 +383,7 @@ def add_actor_information_and_train(
         )
 
         # Wait until the replay buffer has enough samples to start training
-        if len(replay_buffer) < online_step_before_learning:
+        if len(replay_buffer) / cfg.env.num_envs < online_step_before_learning:
             continue
 
         if online_iterator is None:

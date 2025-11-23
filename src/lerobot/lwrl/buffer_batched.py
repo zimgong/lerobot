@@ -284,41 +284,65 @@ class ParallelReplayBuffer:
         we return the last valid observation (s_{t+k-1}) and mark truncated.
 
         When self.n_steps == 1, this reduces to the original single-step semantics.
+        
+        This method guarantees that all sampled indices t, t+1, ..., t+n-1 are always
+        within the valid filled region of the buffer, preventing NaN values from
+        uninitialized memory.
         """
         if not self.initialized:
             raise RuntimeError("Cannot sample from an empty buffer.")
-        total = int(self.size.sum().item())
-        if total == 0:
-            raise RuntimeError("Cannot sample from an empty buffer.")
-        batch_size = min(batch_size, total)
-
+        
         # Snapshot to avoid races with add()
         sizes = self.size.to(self.storage_device)     # [E]
         pos   = self.position.to(self.storage_device) # [E]
-
-        # Global -> (env, idx_in_env)
-        cum = torch.zeros(self.num_envs + 1, device=self.storage_device, dtype=torch.long)
-        cum[1:] = torch.cumsum(sizes, dim=0)
-
-        gidx = torch.randint(0, cum[-1].item(), (batch_size,), device=self.storage_device)
-        env  = torch.bucketize(gidx, cum[1:], right=True)              # [B] in [0,E-1]
-        idx_in_env = gidx - cum[env]                                   # [B] in [0, sizes[env]-1]
-        assert torch.all((idx_in_env >= 0) & (idx_in_env < sizes[env])), "Index escaped env range"
-
-        # Absolute ring indices
-        t = (pos[env] - sizes[env] + idx_in_env) % self.capacity       # [B]
-
-        # ----- n-step planning (no crossing unfilled region) -----
+        
+        if sizes.sum().item() == 0:
+            raise RuntimeError("Cannot sample from an empty buffer.")
+        
         n = int(getattr(self, "n_steps", 1))
         gamma = float(getattr(self, "gamma", 0.99))
-
-        # Max available transitions before reaching pos[env] (exclusive)
-        avail_len = sizes[env] - idx_in_env                             # [B], >=1
-        max_steps = torch.minimum(torch.full_like(avail_len, n), avail_len)  # [B] in [1,n]
-
-        steps = torch.arange(n, device=self.storage_device)             # [n]
-        seq_idx = (t.unsqueeze(1) + steps.unsqueeze(0)) % self.capacity # [B, n]
-        valid_mask = steps.unsqueeze(0) < max_steps.unsqueeze(1)        # [B, n]
+        
+        if n < 1:
+            raise ValueError("n_steps must be >= 1")
+        if n > self.capacity:
+            raise ValueError("n_steps cannot be larger than buffer capacity")
+        
+        # ---------- Only sample starting points with at least n valid steps ----------
+        # valid_starts[e] = # of legal start indices in env e: i in [0, sizes[e]-n]
+        # This ensures that for any sampled idx_in_env, we have idx_in_env + (n-1) <= sizes[e] - 1
+        valid_starts = torch.clamp(sizes - (n - 1), min=0)  # [E]
+        total_valid = int(valid_starts.sum().item())
+        
+        if total_valid == 0:
+            raise RuntimeError(
+                f"Not enough data to sample {n}-step transitions: "
+                f"need at least {n} steps in some environment."
+            )
+        
+        batch_size = min(batch_size, total_valid)
+        
+        # Global -> (env, idx_in_env_start) over valid starting positions
+        cum = torch.zeros(self.num_envs + 1, device=self.storage_device, dtype=torch.long)
+        cum[1:] = torch.cumsum(valid_starts, dim=0)  # [E+1]
+        
+        gidx = torch.randint(0, total_valid, (batch_size,), device=self.storage_device)
+        env = torch.bucketize(gidx, cum[1:], right=True)               # [B] in [0,E-1]
+        idx_in_env = gidx - cum[env]                                   # [B] in [0, valid_starts[env]-1]
+        
+        # This idx_in_env is counted from the oldest transition of that env.
+        # Map to absolute ring-buffer index.
+        t = (pos[env] - sizes[env] + idx_in_env) % self.capacity       # [B]
+        
+        # At this point, by construction:
+        #   idx_in_env + (n-1) <= sizes[env] - 1
+        # so all t + k (k=0..n-1) lie inside the filled region [pos-size, pos-1].
+        
+        # ----- n-step planning (now avail_len >= n always for sampled points) -----
+        avail_len = sizes[env] - idx_in_env                             # [B], >= n
+        max_steps = torch.full_like(avail_len, n)                        # [B], all == n
+        steps = torch.arange(n, device=self.storage_device)              # [n]
+        seq_idx = (t.unsqueeze(1) + steps.unsqueeze(0)) % self.capacity  # [B, n]
+        valid_mask = steps.unsqueeze(0) < max_steps.unsqueeze(1)         # [B, n], all True here
 
         # Episode termination
         term = (self.dones[env.unsqueeze(1), seq_idx] |
@@ -391,7 +415,9 @@ class ParallelReplayBuffer:
             }
 
         # ----- sanity checks -----
-        if (batch_state['observation.state'].abs().max() > 1e5 or
+        if (
+            nstep_rewards.isnan().any() or
+            batch_state['observation.state'].abs().max() > 1e5 or
             batch_next_state['observation.state'].abs().max() > 1e5 or
             torch.isnan(batch_state['observation.state']).any() or
             torch.isnan(batch_next_state['observation.state']).any() or
