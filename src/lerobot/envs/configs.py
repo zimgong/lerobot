@@ -331,6 +331,10 @@ class HILSerlRobotEnvConfig(EnvConfig):
     name: str = "lwlab_sim"
     num_envs: int = 1
 
+    address: str = "0.0.0.0"
+    port: int = 50000
+    authkey: str = "lightwheel"
+
     @property
     def gym_kwargs(self) -> dict:
         return {}

@@ -32,7 +32,7 @@ def make_lwlab_robot_env(cfg: HILSerlRobotEnvConfig) -> tuple[gym.Env, Any]:
     from torch import multiprocessing as mp
     mp.set_start_method("fork", force=True)
 
-    env = RemoteEnv.make(address=('0.0.0.0', 50000), authkey=b'lightwheel')
+    env = RemoteEnv.make(address=(cfg.address, cfg.port), authkey=bytes(cfg.authkey, 'utf-8'))
     env = env.unwrapped
     env.reset()
 
@@ -115,6 +115,11 @@ def step_lwlab_env_and_process_transition(
     processed_action = processed_action_transition[TransitionKey.ACTION]
 
     obs, reward, terminated, truncated, info = env.step(processed_action)
+
+    target_device = processed_action_transition[TransitionKey.DONE].device
+    terminated = terminated.to(target_device)
+    truncated = truncated.to(target_device)
+    reward = reward.to(processed_action_transition[TransitionKey.REWARD].device)
 
     reward = reward + processed_action_transition[TransitionKey.REWARD]
     #! changed to batched or
