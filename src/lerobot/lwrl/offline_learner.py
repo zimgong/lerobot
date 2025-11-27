@@ -399,16 +399,39 @@ def add_actor_information_and_train(
         raise ValueError("Offline buffer is required")
         # full_batch_buffer_iterator = offline_iterator
     
+    # Create encoder optimizer if encoder is not in actor optimizer (when shared_encoder=True)
+    encoder_optimizer = None
+    if policy.shared_encoder:
+        # Get learning rate from actor optimizer
+        actor_lr = optimizers["actor"].param_groups[0]['lr']
+        # Get optimizer hyperparameters from actor optimizer (for consistency)
+        actor_betas = optimizers["actor"].param_groups[0].get('betas', (0.9, 0.999))
+        actor_eps = optimizers["actor"].param_groups[0].get('eps', 1e-8)
+        actor_weight_decay = optimizers["actor"].param_groups[0].get('weight_decay', 0.0)
+        # Create Adam optimizer for encoder parameters
+        encoder_optimizer = torch.optim.Adam(
+            policy.actor.encoder.parameters(),
+            lr=actor_lr,
+            betas=actor_betas,
+            eps=actor_eps,
+            weight_decay=actor_weight_decay,
+        )
+        logging.info(f"[OFFLINE] Created encoder optimizer for BC with LR={actor_lr}")
+
 
     # bc warm up
     if bc_warmup_steps > 0:
         logging.info(f"[OFFLINE] Running BC warmup for {bc_warmup_steps} steps")
         
-        original_encoder_requires_grad = None
-        if hasattr(policy.actor.encoder, "image_encoder") and len(list(policy.actor.encoder.image_encoder.parameters())) > 0:
-            original_encoder_requires_grad = next(policy.actor.encoder.image_encoder.parameters()).requires_grad
+        # Store original requires_grad state for ALL encoder parameters (not just image_encoder)
+        # This is important because the encoder may have other components (spatial_embeddings, 
+        # post_encoders, env_encoder, state_encoder) that also need to be reset
+        original_encoder_requires_grad = {}
+        for name, param in policy.actor.encoder.named_parameters():
+            original_encoder_requires_grad[name] = param.requires_grad
         
         # Ensure actor encoder is trainable
+        # When shared_encoder=True, this also unfreezes the critic encoder since they're the same object
         policy._ensure_actor_encoder_trainable()
 
         for bc_step in tqdm(range(bc_warmup_steps), desc="BC warmup"):
@@ -450,10 +473,19 @@ def add_actor_information_and_train(
             }
 
             bc_out = policy.forward(forward_batch, model="actor_bc")
+            
+            # Zero gradients for both optimizers
             optimizers["actor"].zero_grad()
+            if encoder_optimizer is not None:
+                encoder_optimizer.zero_grad()
+            
             bc_out["loss_actor_bc"].backward()
             clip_grad_norm_(policy.actor.parameters(), clip_grad_norm_value)
+            
+            # Update both optimizers
             optimizers["actor"].step()
+            if encoder_optimizer is not None:
+                encoder_optimizer.step()
 
             if wandb_logger is not None and bc_step % log_freq == 0:
                 wandb_logger.log_dict(
@@ -462,13 +494,14 @@ def add_actor_information_and_train(
                     custom_step_key="BC step",
                 )
         
-        # Reset encoder requires_grad to original value if it was set
-        if original_encoder_requires_grad is not None:
-            for param in policy.actor.encoder.image_encoder.parameters():
-                param.requires_grad_(original_encoder_requires_grad)
+        # Reset ALL encoder parameters to their original requires_grad state
+        # When shared_encoder=True, this also resets the critic encoder since they're the same object
+        for name, param in policy.actor.encoder.named_parameters():
+            if name in original_encoder_requires_grad:
+                param.requires_grad_(original_encoder_requires_grad[name])
         
         # Optionally sync encoders if not shared
-        if cfg.offline.sync_critic_encoder_after_bc and not policy.shared_encoder:
+        if cfg.offline.sync_critic_encoder_after_bc or policy.shared_encoder:
             logging.info("[OFFLINE] Syncing critic encoder with actor encoder after BC...")
             policy.encoder_critic.load_state_dict(policy.actor.encoder.state_dict(), strict=False)
     
@@ -748,12 +781,15 @@ def add_actor_information_and_train(
 
             if bc_steps_after_merge > 0:
                 logging.info(f"[OFFLINE] Running BC finetune for {bc_steps_after_merge} steps...")
-                # Unfreeze encoder for BC stage (full-model BC)
-                original_encoder_requires_grad = None
-                if hasattr(policy.actor.encoder, "image_encoder") and len(list(policy.actor.encoder.image_encoder.parameters())) > 0:
-                    original_encoder_requires_grad = next(policy.actor.encoder.image_encoder.parameters()).requires_grad
+                # Store original requires_grad state for ALL encoder parameters (not just image_encoder)
+                # This is important because the encoder may have other components (spatial_embeddings, 
+                # post_encoders, env_encoder, state_encoder) that also need to be reset
+                original_encoder_requires_grad = {}
+                for name, param in policy.actor.encoder.named_parameters():
+                    original_encoder_requires_grad[name] = param.requires_grad
                 
                 # Ensure actor encoder is trainable
+                # When shared_encoder=True, this also unfreezes the critic encoder since they're the same object
                 policy._ensure_actor_encoder_trainable()
 
                 for bc_step in tqdm(range(bc_steps_after_merge), desc="BC finetune"):
@@ -769,10 +805,19 @@ def add_actor_information_and_train(
                     bc_forward_batch["next_observation_feature"] = next_observation_features
 
                     bc_out = policy.forward(bc_forward_batch, model="actor_bc")
+                    
+                    # Zero gradients for both optimizers
                     optimizers["actor"].zero_grad()
+                    if encoder_optimizer is not None:
+                        encoder_optimizer.zero_grad()
+                    
                     bc_out["loss_actor_bc"].backward()
                     clip_grad_norm_(policy.actor.parameters(), clip_grad_norm_value)
+                    
+                    # Update both optimizers
                     optimizers["actor"].step()
+                    if encoder_optimizer is not None:
+                        encoder_optimizer.step()
 
                     if wandb_logger is not None and bc_step % log_freq == 0:
                         wandb_logger.log_dict(
@@ -804,13 +849,14 @@ def add_actor_information_and_train(
                             shutdown_event=shutdown_event,
                         )
 
-                # Reset encoder requires_grad to original value if it was set
-                if original_encoder_requires_grad is not None:
-                    for param in policy.actor.encoder.image_encoder.parameters():
-                        param.requires_grad_(original_encoder_requires_grad)
+                # Reset ALL encoder parameters to their original requires_grad state
+                # When shared_encoder=True, this also resets the critic encoder since they're the same object
+                for name, param in policy.actor.encoder.named_parameters():
+                    if name in original_encoder_requires_grad:
+                        param.requires_grad_(original_encoder_requires_grad[name])
                 
                 # Optionally sync encoders if not shared
-                if cfg.offline.sync_critic_encoder_after_bc and not policy.shared_encoder:
+                if cfg.offline.sync_critic_encoder_after_bc or policy.shared_encoder:
                     logging.info("[OFFLINE] Syncing critic encoder with actor encoder after BC...")
                     policy.encoder_critic.load_state_dict(policy.actor.encoder.state_dict(), strict=False)
 
