@@ -417,7 +417,7 @@ class OfflineIQLPolicy(PreTrainedPolicy):
         observations: dict[str, Tensor],
         actions: Tensor,
     ) -> tuple[Tensor, dict]:
-        self._ensure_actor_encoder_trainable()
+        # self._ensure_actor_encoder_trainable()
         _, means = self._actor_distribution(
             observations=observations,
             observation_features=None,
@@ -681,8 +681,8 @@ class OfflineIQLPolicy(PreTrainedPolicy):
         return discrete_critic_loss
 
     def _ensure_actor_encoder_trainable(self) -> None:
-        for param in self.actor.encoder.parameters():
+        for name, param in self.actor.encoder.named_parameters():
             if not param.requires_grad:
                 # Enable grad for all encoder params during BC stage
-                print(f"BC Stage: enabling gradients for actor encoder parameters {param.names}")
+                print(f"BC Stage: enabling gradients for actor encoder parameters {name}")
                 param.requires_grad_(True)
