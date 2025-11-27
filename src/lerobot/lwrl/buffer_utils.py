@@ -102,6 +102,7 @@ def convert_buffer_to_dataset_with_features(
         root=root,
         task_name=task_name,
         allowed_features=allowed_features,
+        max_episodes=max_episodes,
     )
     
     return dataset
