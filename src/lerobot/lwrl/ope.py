@@ -160,7 +160,7 @@ def amq_score_from_buffer_sample(
         
         # Get observation features if needed (for frozen encoders)
         obs_feats = None
-        if getattr(policy.config, "freeze_vision_encoder", False) and policy.actor.encoder.has_images:
+        if getattr(policy.config, "shared_encoder", False) and policy.actor.encoder.has_images:
             obs_feats = policy.actor.encoder.get_cached_image_features(observations)
         
         # Compute Q-values using policy's critic ensemble
@@ -248,7 +248,7 @@ def amq_score_from_buffer_online(
         
         # Get observation features if needed (for frozen encoders)
         obs_feats = None
-        if getattr(policy.config, "freeze_vision_encoder", False) and policy.actor.encoder.has_images:
+        if getattr(policy.config, "shared_encoder", False) and policy.actor.encoder.has_images:
             obs_feats = policy.actor.encoder.get_cached_image_features(observations)
         
         # Compute Q-values using policy's critic ensemble
@@ -298,7 +298,7 @@ def amq_score_from_buffer_online(
 
     batch_size = min(env_cfg.num_envs, num_samples)
     batch_num = (num_samples + batch_size - 1) // batch_size
-
+    num_online_samples = 0
 
     for i in tqdm.tqdm(range(batch_num), desc="Calculating Q-values for OPE on online env"):
         observation = {
@@ -309,7 +309,7 @@ def amq_score_from_buffer_online(
         # cached features if the encoder is frozen
         with torch.no_grad():
             obs_feats = None
-            if getattr(policy.config, "freeze_vision_encoder", False) and policy.actor.encoder.has_images:
+            if getattr(policy.config, "shared_encoder", False) and policy.actor.encoder.has_images:
                 obs_feats = policy.actor.encoder.get_cached_image_features(observation)
             dist, _ = policy._actor_distribution(observation, obs_feats)
             action = dist.mode()
@@ -327,6 +327,8 @@ def amq_score_from_buffer_online(
             env_processor=env_processor,
             action_processor=action_processor,
         )
+
+        num_online_samples += online_env.num_envs
 
         # Teleop action is the action that was executed in the environment
         # It is either the action from the teleop device or the action from the policy
@@ -370,12 +372,11 @@ def amq_score_from_buffer_online(
             transition = new_transition_with_reset
         else:
             transition = new_transition
-
     
     # Compute AM-Q score as mean of q_min values
     if total_samples > 0:
         score_prev = total_q_sum_prev / total_samples
-        score_current = total_q_sum_current / total_samples
+        score_current = total_q_sum_current / num_online_samples
     else:
         score_prev = float("-inf")
         score_current = float("-inf")

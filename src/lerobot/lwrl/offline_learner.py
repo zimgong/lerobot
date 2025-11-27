@@ -263,12 +263,16 @@ def add_actor_information_and_train(
     device = get_safe_torch_device(try_device=cfg.learner_device, log=True)
     storage_device = get_safe_torch_device(try_device=cfg.policy.storage_device)
     clip_grad_norm_value = cfg.policy.grad_clip_norm
+    online_step_before_learning = cfg.policy.online_step_before_learning
     fps = cfg.env.fps
     log_freq = cfg.log_freq
     save_freq = cfg.save_freq
     policy_update_freq = cfg.policy.policy_update_freq
     saving_checkpoint = cfg.save_checkpoint
     async_prefetch = cfg.policy.async_prefetch
+
+    # n steps in buffer
+    n_steps = cfg.policy.n_steps
 
     # offline training parameters
     offline_iters = cfg.offline.iters
@@ -328,7 +332,7 @@ def add_actor_information_and_train(
             storage_device=storage_device,
             return_features=True,
         )
-        batch_size: int = batch_size # // 2  # We will sample from both replay buffer
+        batch_size: int = batch_size // 2  # We will sample from both replay buffer
     else:
         raise ValueError("Dataset is required for offline training")
 
@@ -349,21 +353,57 @@ def add_actor_information_and_train(
     #     progress_bar.update(resume_optimization_step)
     #     last_accept_step = resume_optimization_step
 
-    # bc warm up
+    # prefill step
+    progress_bar = tqdm(total=max(online_step_before_learning, n_steps), desc="Prefill Online Buffer")
+    buffer_size = 0
+    while len(replay_buffer) // cfg.env.num_envs < max(online_step_before_learning, n_steps):
+        # Process all available transitions to the replay buffer, send by the actor server
+        process_transitions(
+            transition_queue=transition_queue,
+            replay_buffer=replay_buffer,
+            offline_replay_buffer=offline_replay_buffer,
+            device=storage_device,
+            dataset_repo_id=dataset_repo_id,
+            shutdown_event=shutdown_event,
+        )
 
-    if bc_warmup_steps > 0:
-        logging.info(f"[OFFLINE] Running BC warmup for {bc_warmup_steps} steps")
+        # Process all available interaction messages sent by the actor server
+        interaction_message = process_interaction_messages(
+            interaction_message_queue=interaction_message_queue,
+            interaction_step_shift=interaction_step_shift,
+            wandb_logger=wandb_logger,
+            shutdown_event=shutdown_event,
+        )
+        if len(replay_buffer) // cfg.env.num_envs > buffer_size:
+            buffer_size = len(replay_buffer) // cfg.env.num_envs
+            progress_bar.update(buffer_size - progress_bar.n)
 
-        if online_iterator is None:
+            
+    # get the iterators for the online and offline buffers
+    # Online iterator is the iterator for the online buffer, the batch size //2 if offline buffer is not None
+    # Offline iterator is the iterator for the offline buffer
+    # Full batch buffer iterator is the iterator for the full batch buffer
+    if online_iterator is None:
             online_iterator = replay_buffer.get_iterator(
                 batch_size=batch_size, async_prefetch=async_prefetch, queue_size=2
             )
         
-        if offline_replay_buffer is not None and offline_iterator is None:
-            offline_iterator = offline_replay_buffer.get_iterator(
-                batch_size=batch_size, async_prefetch=async_prefetch, queue_size=2
-            )
+    if offline_replay_buffer is not None and offline_iterator is None:
+        offline_iterator = offline_replay_buffer.get_iterator(
+            batch_size=batch_size, async_prefetch=async_prefetch, queue_size=2
+        )
+        full_batch_buffer_iterator = offline_replay_buffer.get_iterator(
+            batch_size=batch_size * 2, async_prefetch=async_prefetch, queue_size=2
+        )
+    else:
+        raise ValueError("Offline buffer is required")
+        # full_batch_buffer_iterator = offline_iterator
+    
 
+    # bc warm up
+    if bc_warmup_steps > 0:
+        logging.info(f"[OFFLINE] Running BC warmup for {bc_warmup_steps} steps")
+        
         original_encoder_requires_grad = None
         if hasattr(policy.actor.encoder, "image_encoder") and len(list(policy.actor.encoder.image_encoder.parameters())) > 0:
             original_encoder_requires_grad = next(policy.actor.encoder.image_encoder.parameters()).requires_grad
@@ -373,29 +413,26 @@ def add_actor_information_and_train(
 
         for bc_step in tqdm(range(bc_warmup_steps), desc="BC warmup"):
 
-            # Process all available transitions to the replay buffer, send by the actor server
-            process_transitions(
-                transition_queue=transition_queue,
-                replay_buffer=replay_buffer,
-                offline_replay_buffer=offline_replay_buffer,
-                device=storage_device,
-                dataset_repo_id=dataset_repo_id,
-                shutdown_event=shutdown_event,
-            )
+            if bc_step % 10 == 0:
+                # Process all available transitions to the replay buffer, send by the actor server
+                process_transitions(
+                    transition_queue=transition_queue,
+                    replay_buffer=replay_buffer,
+                    offline_replay_buffer=offline_replay_buffer,
+                    device=storage_device,
+                    dataset_repo_id=dataset_repo_id,
+                    shutdown_event=shutdown_event,
+                )
 
-            # Process all available interaction messages sent by the actor server
-            interaction_message = process_interaction_messages(
-                interaction_message_queue=interaction_message_queue,
-                interaction_step_shift=interaction_step_shift,
-                wandb_logger=wandb_logger,
-                shutdown_event=shutdown_event,
-            )
-
-            offline_batch = next(offline_iterator)
-            online_batch = next(online_iterator)
-            batch = concatenate_batch_transitions(
-                left_batch_transitions=offline_batch, right_batch_transition=online_batch
-            )
+                # Process all available interaction messages sent by the actor server
+                interaction_message = process_interaction_messages(
+                    interaction_message_queue=interaction_message_queue,
+                    interaction_step_shift=interaction_step_shift,
+                    wandb_logger=wandb_logger,
+                    shutdown_event=shutdown_event,
+                )
+            
+            batch = next(full_batch_buffer_iterator)
 
             actions = batch[ACTION]
             observations = batch["state"]
@@ -449,33 +486,32 @@ def add_actor_information_and_train(
                 logging.info("[LEARNER] Shutdown signal received. Exiting...")
                 break
 
-            # Process all available transitions to the replay buffer, send by the actor server
-            process_transitions(
-                transition_queue=transition_queue,
-                replay_buffer=replay_buffer,
-                offline_replay_buffer=offline_replay_buffer,
-                device=storage_device,
-                dataset_repo_id=dataset_repo_id,
-                shutdown_event=shutdown_event,
-            )
+            if iter_step % 10 == 0:
+                # Process all available transitions to the replay buffer, send by the actor server
+                process_transitions(
+                    transition_queue=transition_queue,
+                    replay_buffer=replay_buffer,
+                    offline_replay_buffer=offline_replay_buffer,
+                    device=storage_device,
+                    dataset_repo_id=dataset_repo_id,
+                    shutdown_event=shutdown_event,
+                )
 
-            # Process all available interaction messages sent by the actor server
-            interaction_message = process_interaction_messages(
-                interaction_message_queue=interaction_message_queue,
-                interaction_step_shift=interaction_step_shift,
-                wandb_logger=wandb_logger,
-                shutdown_event=shutdown_event,
-            )
-
-            if offline_replay_buffer is not None and offline_iterator is None:
-                offline_iterator = offline_replay_buffer.get_iterator(
-                    batch_size=batch_size, async_prefetch=async_prefetch, queue_size=2
+                # Process all available interaction messages sent by the actor server
+                interaction_message = process_interaction_messages(
+                    interaction_message_queue=interaction_message_queue,
+                    interaction_step_shift=interaction_step_shift,
+                    wandb_logger=wandb_logger,
+                    shutdown_event=shutdown_event,
                 )
 
             time_for_one_optimization_step = time.time()
             
-            # Sample for the last update in the UTD ratio
-            batch = next(offline_iterator)
+            offline_batch = next(offline_iterator)
+            online_batch = next(online_iterator)
+            batch = concatenate_batch_transitions(
+                left_batch_transitions=offline_batch, right_batch_transition=online_batch
+            )
 
             actions = batch[ACTION]
             rewards = batch["reward"]
@@ -522,7 +558,47 @@ def add_actor_information_and_train(
             critic_grad_norm = clip_grad_norm_(policy.critic_ensemble.parameters(), clip_grad_norm_value).item()
             optimizers["critic"].step()
 
+            # Discrete critic optimization (if available)
+            assert policy.config.num_discrete_actions is None, "Discrete critic is not supported for offline training"
+            if policy.config.num_discrete_actions is not None:
+                discrete_critic_output = policy.forward(forward_batch, model="discrete_critic")
+                loss_discrete_critic = discrete_critic_output["loss_discrete_critic"]
+                optimizers["discrete_critic"].zero_grad()
+                loss_discrete_critic.backward()
+                discrete_critic_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    parameters=policy.discrete_critic.parameters(), max_norm=clip_grad_norm_value
+                ).item()
+                optimizers["discrete_critic"].step()
+
+                # Add discrete critic info to training info
+                training_infos["loss_discrete_critic"] = loss_discrete_critic.item()
+                training_infos["discrete_critic_grad_norm"] = discrete_critic_grad_norm
+                training_infos.update(discrete_critic_output.get("q_info", {}))
+
             # ------------- ACTOR (AWR or PPO-style) -------------
+            # reconstruct forward batch with pure offline data (we need to keep all samples to be positive)
+            # TODO: this loop can be more efficient if policy_update_freq is not 1
+            full_offline_batch = next(full_batch_buffer_iterator)
+            full_offline_actions = full_offline_batch[ACTION]
+            full_offline_observations = full_offline_batch["state"]
+            full_offline_next_observations = full_offline_batch["next_state"]
+            full_offline_done = full_offline_batch["done"]
+            full_offline_reward = full_offline_batch["reward"]
+            check_nan_in_transition(observations=full_offline_observations, actions=full_offline_actions, next_state=full_offline_next_observations)
+            full_offline_observation_features, full_offline_next_observation_features = get_observation_features(
+                policy=policy, observations=full_offline_observations, next_observations=full_offline_next_observations
+            )
+            full_offline_forward_batch = {
+                ACTION: full_offline_actions,
+                "reward": full_offline_reward,
+                "state": full_offline_observations,
+                "next_state": full_offline_next_observations,
+                "done": full_offline_done,
+                "observation_feature": full_offline_observation_features,
+                "next_observation_feature": full_offline_next_observation_features,
+            }
+            forward_batch = full_offline_forward_batch # overwrite with pure offline data
+
             if cfg.policy.actor_update == "awr":
                 actor_output = policy.forward(forward_batch, model="actor")
                 loss_actor = actor_output["loss_actor"]
@@ -542,22 +618,6 @@ def add_actor_information_and_train(
                     clip_grad_norm_value,
                 ).item()
                 optimizers["actor"].step()
-
-            # Discrete critic optimization (if available)
-            if policy.config.num_discrete_actions is not None:
-                discrete_critic_output = policy.forward(forward_batch, model="discrete_critic")
-                loss_discrete_critic = discrete_critic_output["loss_discrete_critic"]
-                optimizers["discrete_critic"].zero_grad()
-                loss_discrete_critic.backward()
-                discrete_critic_grad_norm = torch.nn.utils.clip_grad_norm_(
-                    parameters=policy.discrete_critic.parameters(), max_norm=clip_grad_norm_value
-                ).item()
-                optimizers["discrete_critic"].step()
-
-                # Add discrete critic info to training info
-                training_infos["loss_discrete_critic"] = loss_discrete_critic.item()
-                training_infos["discrete_critic_grad_norm"] = discrete_critic_grad_norm
-                training_infos.update(discrete_critic_output.get("q_info", {}))
 
             policy.update_target_networks()
 
@@ -673,6 +733,9 @@ def add_actor_information_and_train(
             offline_iterator = offline_replay_buffer.get_iterator(
                 batch_size=batch_size, async_prefetch=async_prefetch, queue_size=2
             )
+            full_batch_buffer_iterator = offline_replay_buffer.get_iterator(
+                batch_size=batch_size * 2, async_prefetch=async_prefetch, queue_size=2
+            )
 
             # Push parameters to actor server (atomic: before buffer reinit)
             # Note: We put this before BC finetune for better stability of the training loop
@@ -694,7 +757,7 @@ def add_actor_information_and_train(
                 policy._ensure_actor_encoder_trainable()
 
                 for bc_step in tqdm(range(bc_steps_after_merge), desc="BC finetune"):
-                    bc_batch = next(offline_iterator)
+                    bc_batch = next(full_batch_buffer_iterator)
                     bc_forward_batch = {
                         "action": bc_batch["action"],
                         "state": bc_batch["state"],
@@ -722,23 +785,24 @@ def add_actor_information_and_train(
                             custom_step_key="Optimization step",
                         )
 
-                    # Process all available transitions to the replay buffer, send by the actor server
-                    process_transitions(
-                        transition_queue=transition_queue,
-                        replay_buffer=replay_buffer,
-                        offline_replay_buffer=offline_replay_buffer,
-                        device=storage_device,
-                        dataset_repo_id=dataset_repo_id,
-                        shutdown_event=shutdown_event,
-                    )
+                    if bc_step % 10 == 0:
+                        # Process all available transitions to the replay buffer, send by the actor server
+                        process_transitions(
+                            transition_queue=transition_queue,
+                            replay_buffer=replay_buffer,
+                            offline_replay_buffer=offline_replay_buffer,
+                            device=storage_device,
+                            dataset_repo_id=dataset_repo_id,
+                            shutdown_event=shutdown_event,
+                        )
 
-                    # Process all available interaction messages sent by the actor server
-                    interaction_message = process_interaction_messages(
-                        interaction_message_queue=interaction_message_queue,
-                        interaction_step_shift=interaction_step_shift,
-                        wandb_logger=wandb_logger,
-                        shutdown_event=shutdown_event,
-                    )
+                        # Process all available interaction messages sent by the actor server
+                        interaction_message = process_interaction_messages(
+                            interaction_message_queue=interaction_message_queue,
+                            interaction_step_shift=interaction_step_shift,
+                            wandb_logger=wandb_logger,
+                            shutdown_event=shutdown_event,
+                        )
 
                 # Reset encoder requires_grad to original value if it was set
                 if original_encoder_requires_grad is not None:

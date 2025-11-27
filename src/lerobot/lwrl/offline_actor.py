@@ -337,7 +337,7 @@ def act_with_policy(
 
             # Optional cached features if the encoder is frozen
             obs_feats = None
-            if getattr(policy.config, "freeze_vision_encoder", False) and policy.actor.encoder.has_images:
+            if getattr(policy, "shared_encoder", False) and policy.actor.encoder.has_images:
                 obs_feats = policy.actor.encoder.get_cached_image_features(observation)
 
             action, logp = _actor_logprob(policy, observation, obs_feats)
