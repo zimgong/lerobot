@@ -278,7 +278,7 @@ def add_actor_information_and_train(
     offline_iters = cfg.offline.iters
     iql_steps_per_iter = cfg.offline.iql_steps
     bc_steps_after_merge = cfg.offline.bc_steps_after_merge
-    bc_warmup_steps = cfg.offline.bc_steps_after_merge
+    bc_warmup_steps = cfg.offline.bc_steps_after_merge * 2
     ope_adaptive_threshold_fraction = cfg.offline.ope_adaptive_threshold_fraction
     max_ope_iterations = cfg.offline.max_ope_iterations
     ope_iterations = 0
@@ -430,9 +430,9 @@ def add_actor_information_and_train(
         for name, param in policy.actor.encoder.named_parameters():
             original_encoder_requires_grad[name] = param.requires_grad
         
-        # Ensure actor encoder is trainable
-        # When shared_encoder=True, this also unfreezes the critic encoder since they're the same object
-        policy._ensure_actor_encoder_trainable()
+        # # Ensure actor encoder is trainable
+        # # When shared_encoder=True, this also unfreezes the critic encoder since they're the same object
+        # policy._ensure_actor_encoder_trainable()
 
         for bc_step in tqdm(range(bc_warmup_steps), desc="BC warmup"):
 
@@ -476,16 +476,16 @@ def add_actor_information_and_train(
             
             # Zero gradients for both optimizers
             optimizers["actor"].zero_grad()
-            if encoder_optimizer is not None:
-                encoder_optimizer.zero_grad()
+            # if encoder_optimizer is not None:
+            #     encoder_optimizer.zero_grad()
             
             bc_out["loss_actor_bc"].backward()
             clip_grad_norm_(policy.actor.parameters(), clip_grad_norm_value)
             
             # Update both optimizers
             optimizers["actor"].step()
-            if encoder_optimizer is not None:
-                encoder_optimizer.step()
+            # if encoder_optimizer is not None:
+            #     encoder_optimizer.step()
 
             if wandb_logger is not None and bc_step % log_freq == 0:
                 wandb_logger.log_dict(
@@ -494,11 +494,11 @@ def add_actor_information_and_train(
                     custom_step_key="BC step",
                 )
         
-        # Reset ALL encoder parameters to their original requires_grad state
-        # When shared_encoder=True, this also resets the critic encoder since they're the same object
-        for name, param in policy.actor.encoder.named_parameters():
-            if name in original_encoder_requires_grad:
-                param.requires_grad_(original_encoder_requires_grad[name])
+        # # Reset ALL encoder parameters to their original requires_grad state
+        # # When shared_encoder=True, this also resets the critic encoder since they're the same object
+        # for name, param in policy.actor.encoder.named_parameters():
+        #     if name in original_encoder_requires_grad:
+        #         param.requires_grad_(original_encoder_requires_grad[name])
         
         # Optionally sync encoders if not shared
         if cfg.offline.sync_critic_encoder_after_bc or policy.shared_encoder:
