@@ -1,6 +1,6 @@
 {    
     "output_dir": null,
-    "job_name": "lwlab_lerobot_pickup_280episodes_offline_rl_online_ope",
+    "job_name": "lwlab_lerobot_pickup_280episodes_offline_rl_online_ope_fixlossspike",
     "resume": false,
     "resume_from_output_dir": "/home/johndoe/Documents/lerobot-hilserl/outputs/train/2025-11-09/10-24-39_lwlab_lerobot_pickup_280episodes_offline_warmup",
     "seed": 1000,
@@ -26,7 +26,7 @@
     "offline": {
         "iters": 300,
         "iql_steps": 1000,
-        "bc_steps_after_merge": 1000,
+        "bc_steps_after_merge": 500,
         "sync_critic_encoder_after_bc": false,
         "success_keep_ratio": 1.0,
         "ope_adaptive_threshold_fraction": 0.05,
@@ -34,7 +34,7 @@
         "pretrain_path": "/home/johndoe/Documents/lerobot-hilserl/outputs/train/2025-11-09/10-24-39_lwlab_lerobot_pickup_280episodes_offline_warmup/checkpoints/050000/policy_50000.pkl", 
         "ope_num_samples": 5000,
 
-        "max_online_episodes_added_per_iter": 50
+        "max_online_episodes_added_per_iter": 25
     },
     "policy": {
         "type": "offline",
@@ -303,20 +303,20 @@
             "std_max": 2,
             "init_final": 0.05,
             "action_low_bound": [
-                -5.259829044342041,
-                -3.946262836456299,
-                -4.712678909301758,
-                -10.8388032913208,
-                -6.196352958679199,
-                -3.483210563659668
+                -7.259829044342041,
+                -5.946262836456299,
+                -6.712678909301758,
+                -12.8388032913208,
+                -8.196352958679199,
+                -5.483210563659668
             ],
             "action_high_bound": [
-                3.0570151805877686,
-                12.902525901794434,
-                10.454845428466797,
-                6.118478775024414,
-                5.915607452392578,
-                1.2877321243286133
+                5.0570151805877686,
+                14.902525901794434,
+                12.454845428466797,
+                8.118478775024414,
+                7.915607452392578,
+                3.2877321243286133
             ]
         },
         "actor_learner_config": {
