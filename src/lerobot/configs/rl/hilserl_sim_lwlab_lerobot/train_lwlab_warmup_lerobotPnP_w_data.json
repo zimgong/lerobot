@@ -1,0 +1,358 @@
+{    
+    "output_dir": null,
+    "job_name": "lwlab_lerobot_pickup_280episodes_offline_warmup",
+    "resume": false,
+    "resume_from_output_dir": "/home/johndoe/Documents/lerobot-hilserl/outputs/train/2025-10-05/00-57-03_lwlab_lerobot_pickup_100env_nsteps3/",
+    "seed": 1000,
+    "num_workers": 4,
+    "batch_size": 256,
+    "steps": 200000,
+    "log_freq": 1,
+    "save_checkpoint": true,
+    "save_freq": 2500,
+    "wandb": {
+        "enable": true,
+        "mode": "online",
+        "project": "lwlab_sim",
+        "disable_artifact": true
+    },
+    "dataset": {
+        "root": "/home/johndoe/Documents/lerobot-hilserl/data/lerobot_lift_visual_processed_280",
+        "repo_id": "lerobot_lift_visual_offline_data_processed",
+        "use_imagenet_stats": false
+    },
+    "policy": {
+        "type": "offline",
+        "n_obs_steps": 1,
+        "repo_id": "hf_username/policy_name",
+        "normalization_mapping": {
+            "VISUAL": "MEAN_STD",
+            "STATE": "MIN_MAX",
+            "ENV": "MIN_MAX",
+            "ACTION": "MIN_MAX"
+        },
+        "input_features": {
+            "observation.images.image_global": {
+                "type": "VISUAL",
+                "shape": [
+                    3,
+                    128,
+                    128
+                ]
+            },
+            "observation.state": {
+                "type": "STATE",
+                "shape": [
+                    17
+                ]
+            },
+            "observation.environment_state": {
+                "type": "STATE",
+                "shape": [
+                    17
+                ]
+            }
+        },
+        "output_features": {
+            "action": {
+                "type": "ACTION",
+                "shape": [
+                    6
+                ]
+            }
+        },
+        "device": "cuda",
+        "use_amp": false,
+        "dataset_stats": {
+            "observation.images.image_global": {
+                "mean": [
+                    0.485,
+                    0.456,
+                    0.406
+                ],
+                "std": [
+                    0.229,
+                    0.169,
+                    0.166
+                ]
+            },
+            "observation.state": {
+                "min": [
+                    -0.33423101902008057,
+                    0.0,
+                    -0.3839914798736572,
+                    0.767565131187439,
+                    1.0467044115066528,
+                    0.05212025344371796,
+                    -0.6032499074935913,
+                    0.0,
+                    -0.4280790090560913,
+                    0.0,
+                    0.0,
+                    -0.07159817218780518,
+                    -0.6032499074935913,
+                    0.0,
+                    -0.4280790090560913,
+                    -1.5707963705062866,
+                    -1.5707963705062866
+                ],
+                "max": [
+                    0.43570759892463684,
+                    0.6520180106163025,
+                    0.29653236269950867,
+                    1.605927586555481,
+                    1.5956183671951294,
+                    1.074834942817688,
+                    0.46205511689186096,
+                    0.6850968599319458,
+                    0.5307146310806274,
+                    1.7080928087234497,
+                    1.6397886276245117,
+                    1.1276843547821045,
+                    0.46205511689186096,
+                    0.6850968599319458,
+                    0.5307146310806274,
+                    0.13729643821716309,
+                    0.0689922571182251
+                ],
+                "mean": [
+                    0.012490673617336032,
+                    0.2586446950512707,
+                    -0.013172282640360728,
+                    1.3584671544610831,
+                    1.4026680815984642,
+                    0.5241058203564198,
+                    0.00896454223931879,
+                    0.2900808467234057,
+                    -0.016816705979512122,
+                    1.3143943743928088,
+                    1.3650860140721004,
+                    0.42290692481769143,
+                    0.00896454223931879,
+                    0.2900808467234057,
+                    -0.016816705979512122,
+                    -0.256401999830145,
+                    -0.20571035635657617
+                ],
+                "std": [
+                    0.1425587089582585,
+                    0.15078561282096833,
+                    0.12158610234559239,
+                    0.14732013363886837,
+                    0.10495074567554673,
+                    0.2769899924362583,
+                    0.15496321616483122,
+                    0.1318418002423326,
+                    0.13382275866119236,
+                    0.20312486805414853,
+                    0.18856839242531379,
+                    0.2965934165434334,
+                    0.15496321616483122,
+                    0.1318418002423326,
+                    0.13382275866119236,
+                    0.20312486912886119,
+                    0.18856839552791027
+                ]
+            },
+            "observation.environment_state": {
+                "min": [
+                    -0.33423101902008057,
+                    0.0,
+                    -0.3839914798736572,
+                    0.767565131187439,
+                    1.0467044115066528,
+                    0.05212025344371796,
+                    -0.6032499074935913,
+                    0.0,
+                    -0.4280790090560913,
+                    0.0,
+                    0.0,
+                    -0.07159817218780518,
+                    -0.6032499074935913,
+                    0.0,
+                    -0.4280790090560913,
+                    -1.5707963705062866,
+                    -1.5707963705062866
+                ],
+                "max": [
+                    0.43570759892463684,
+                    0.6520180106163025,
+                    0.29653236269950867,
+                    1.605927586555481,
+                    1.5956183671951294,
+                    1.074834942817688,
+                    0.46205511689186096,
+                    0.6850968599319458,
+                    0.5307146310806274,
+                    1.7080928087234497,
+                    1.6397886276245117,
+                    1.1276843547821045,
+                    0.46205511689186096,
+                    0.6850968599319458,
+                    0.5307146310806274,
+                    0.13729643821716309,
+                    0.0689922571182251
+                ],
+                "mean": [
+                    0.012490673617336032,
+                    0.2586446950512707,
+                    -0.013172282640360728,
+                    1.3584671544610831,
+                    1.4026680815984642,
+                    0.5241058203564198,
+                    0.00896454223931879,
+                    0.2900808467234057,
+                    -0.016816705979512122,
+                    1.3143943743928088,
+                    1.3650860140721004,
+                    0.42290692481769143,
+                    0.00896454223931879,
+                    0.2900808467234057,
+                    -0.016816705979512122,
+                    -0.256401999830145,
+                    -0.20571035635657617
+                ],
+                "std": [
+                    0.1425587089582585,
+                    0.15078561282096833,
+                    0.12158610234559239,
+                    0.14732013363886837,
+                    0.10495074567554673,
+                    0.2769899924362583,
+                    0.15496321616483122,
+                    0.1318418002423326,
+                    0.13382275866119236,
+                    0.20312486805414853,
+                    0.18856839242531379,
+                    0.2965934165434334,
+                    0.15496321616483122,
+                    0.1318418002423326,
+                    0.13382275866119236,
+                    0.20312486912886119,
+                    0.18856839552791027
+                ]
+            }
+        },
+        "storage_device": "cpu",
+        "vision_encoder_name": "helper2424/resnet10",
+        "freeze_vision_encoder": true,
+        "image_encoder_hidden_dim": 32,
+        "shared_encoder": true,
+        "online_steps": 1000000,
+        "online_buffer_capacity": 100000,
+        "offline_buffer_capacity": 70000,
+        "online_step_before_learning": 100,
+        "policy_update_freq": 1,
+        "discount": 0.97,
+        "n_steps": 3,
+        "temperature_init": 0.01,
+        "num_critics": 2,
+        "num_subsample_critics": null,
+        "critic_lr": 0.0001,
+        "actor_lr": 0.00001,
+        "temperature_lr": 0.0003,
+        "critic_target_update_weight": 0.005,
+        "utd_ratio": 2,
+        "state_encoder_hidden_dim": 256,
+        "latent_dim": 64,
+        "target_entropy": null,
+        "use_backup_entropy": true,
+        "grad_clip_norm": 1.0,
+        "num_discrete_actions": null,
+        "critic_network_kwargs": {
+            "hidden_dims": [
+                256,
+                256
+            ],
+            "activate_final": true,
+            "final_activation": null
+        },
+        "actor_network_kwargs": {
+            "hidden_dims": [
+                256,
+                256
+            ],
+            "activate_final": true
+        },
+        "policy_kwargs": {
+            "use_tanh_squash": true,
+            "std_min": 1e-5,
+            "std_max": 2,
+            "init_final": 0.05,
+            "action_low_bound": [
+                -5.259829044342041,
+                -3.946262836456299,
+                -4.712678909301758,
+                -10.8388032913208,
+                -6.196352958679199,
+                -3.483210563659668
+            ],
+            "action_high_bound": [
+                3.0570151805877686,
+                12.902525901794434,
+                10.454845428466797,
+                6.118478775024414,
+                5.915607452392578,
+                1.2877321243286133
+            ]
+        },
+        "actor_learner_config": {
+            "learner_host": "127.0.0.1",
+            "learner_port": 50051,
+            "policy_parameters_push_frequency": 10
+        },
+        "concurrency": {
+            "actor": "threads",
+            "learner": "threads"
+        }
+    },
+    "env": {
+        "type": "lwlab",
+        "name": "lwlab_sim",
+        "task": "lerobot_liftobj_visual_hilserl",
+        "num_envs": 100,
+        "fps": 10,
+        "robot": null,
+        "teleop": null,
+        "processor": {
+            "ENV_STATE_KEYS": ["joint_pos", "target_qpos", "delta_reset_qpos"],
+            "OBS_STATE_KEYS": ["joint_pos", "target_qpos", "delta_reset_qpos"],
+            "CAMERA_KEYS": ["image_global"],
+
+            "control_mode": "gamepad",
+            "reset": {
+                "fixed_reset_joint_positions": null,
+                "reset_time_s": 2.0,
+                "control_time_s": 15.0,
+                "terminate_on_success": true
+            }
+        },
+        "features": {
+            "observation.images.image_global": {
+                "type": "VISUAL",
+                "shape": [
+                    3,
+                    128,
+                    128
+                ]
+            },
+            "observation.state": {
+                "type": "STATE",
+                "shape": [
+                    17
+                ]
+            },
+            "action": {
+                "type": "ACTION",
+                "shape": [
+                    6
+                ]
+            }
+        },
+        "features_map": {
+            "observation.images.image_global": "observation.images.image_global",
+            "observation.state": "observation.state",
+            "action": "action"
+        }
+    }
+}

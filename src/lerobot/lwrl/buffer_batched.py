@@ -139,7 +139,13 @@ class ParallelReplayBuffer:
 
         if image_augmentation_function is None:
             base_function = functools.partial(random_shift, pad=4)
-            self.image_augmentation_function = torch.compile(base_function)
+            # Skip torch.compile for MPS (Metal) backend due to shader compilation issues
+            # See: https://github.com/pytorch/pytorch/issues/150121
+            device_str = str(device).lower()
+            if "mps" in device_str:
+                self.image_augmentation_function = base_function
+            else:
+                self.image_augmentation_function = torch.compile(base_function)
         self.use_drq = use_drq
 
     def _initialize_storage(
@@ -197,6 +203,19 @@ class ParallelReplayBuffer:
                     raise ValueError(f"Unsupported type {type(value)} for complementary_info[{key}]")
 
         self.initialized = True
+
+    def clear(self) -> None:
+        """Clear all data from the buffer while keeping the same object.
+        
+        Resets position, size, and initialized flag. The storage tensors remain
+        allocated but are effectively empty. This is more efficient than recreating
+        the buffer and maintains object identity.
+        """
+        self.position.zero_()
+        self.size.zero_()
+        self.initialized = False
+        # Note: We don't clear the storage tensors themselves to avoid reallocation
+        # The buffer will be re-initialized on the next add() call
 
     def __len__(self):
         return self.size.sum().item()
@@ -265,41 +284,65 @@ class ParallelReplayBuffer:
         we return the last valid observation (s_{t+k-1}) and mark truncated.
 
         When self.n_steps == 1, this reduces to the original single-step semantics.
+        
+        This method guarantees that all sampled indices t, t+1, ..., t+n-1 are always
+        within the valid filled region of the buffer, preventing NaN values from
+        uninitialized memory.
         """
         if not self.initialized:
             raise RuntimeError("Cannot sample from an empty buffer.")
-        total = int(self.size.sum().item())
-        if total == 0:
-            raise RuntimeError("Cannot sample from an empty buffer.")
-        batch_size = min(batch_size, total)
-
+        
         # Snapshot to avoid races with add()
         sizes = self.size.to(self.storage_device)     # [E]
         pos   = self.position.to(self.storage_device) # [E]
-
-        # Global -> (env, idx_in_env)
-        cum = torch.zeros(self.num_envs + 1, device=self.storage_device, dtype=torch.long)
-        cum[1:] = torch.cumsum(sizes, dim=0)
-
-        gidx = torch.randint(0, cum[-1].item(), (batch_size,), device=self.storage_device)
-        env  = torch.bucketize(gidx, cum[1:], right=True)              # [B] in [0,E-1]
-        idx_in_env = gidx - cum[env]                                   # [B] in [0, sizes[env]-1]
-        assert torch.all((idx_in_env >= 0) & (idx_in_env < sizes[env])), "Index escaped env range"
-
-        # Absolute ring indices
-        t = (pos[env] - sizes[env] + idx_in_env) % self.capacity       # [B]
-
-        # ----- n-step planning (no crossing unfilled region) -----
+        
+        if sizes.sum().item() == 0:
+            raise RuntimeError("Cannot sample from an empty buffer.")
+        
         n = int(getattr(self, "n_steps", 1))
         gamma = float(getattr(self, "gamma", 0.99))
-
-        # Max available transitions before reaching pos[env] (exclusive)
-        avail_len = sizes[env] - idx_in_env                             # [B], >=1
-        max_steps = torch.minimum(torch.full_like(avail_len, n), avail_len)  # [B] in [1,n]
-
-        steps = torch.arange(n, device=self.storage_device)             # [n]
-        seq_idx = (t.unsqueeze(1) + steps.unsqueeze(0)) % self.capacity # [B, n]
-        valid_mask = steps.unsqueeze(0) < max_steps.unsqueeze(1)        # [B, n]
+        
+        if n < 1:
+            raise ValueError("n_steps must be >= 1")
+        if n > self.capacity:
+            raise ValueError("n_steps cannot be larger than buffer capacity")
+        
+        # ---------- Only sample starting points with at least n valid steps ----------
+        # valid_starts[e] = # of legal start indices in env e: i in [0, sizes[e]-n]
+        # This ensures that for any sampled idx_in_env, we have idx_in_env + (n-1) <= sizes[e] - 1
+        valid_starts = torch.clamp(sizes - (n - 1), min=0)  # [E]
+        total_valid = int(valid_starts.sum().item())
+        
+        if total_valid == 0:
+            raise RuntimeError(
+                f"Not enough data to sample {n}-step transitions: "
+                f"need at least {n} steps in some environment."
+            )
+        
+        batch_size = min(batch_size, total_valid)
+        
+        # Global -> (env, idx_in_env_start) over valid starting positions
+        cum = torch.zeros(self.num_envs + 1, device=self.storage_device, dtype=torch.long)
+        cum[1:] = torch.cumsum(valid_starts, dim=0)  # [E+1]
+        
+        gidx = torch.randint(0, total_valid, (batch_size,), device=self.storage_device)
+        env = torch.bucketize(gidx, cum[1:], right=True)               # [B] in [0,E-1]
+        idx_in_env = gidx - cum[env]                                   # [B] in [0, valid_starts[env]-1]
+        
+        # This idx_in_env is counted from the oldest transition of that env.
+        # Map to absolute ring-buffer index.
+        t = (pos[env] - sizes[env] + idx_in_env) % self.capacity       # [B]
+        
+        # At this point, by construction:
+        #   idx_in_env + (n-1) <= sizes[env] - 1
+        # so all t + k (k=0..n-1) lie inside the filled region [pos-size, pos-1].
+        
+        # ----- n-step planning (now avail_len >= n always for sampled points) -----
+        avail_len = sizes[env] - idx_in_env                             # [B], >= n
+        max_steps = torch.full_like(avail_len, n)                        # [B], all == n
+        steps = torch.arange(n, device=self.storage_device)              # [n]
+        seq_idx = (t.unsqueeze(1) + steps.unsqueeze(0)) % self.capacity  # [B, n]
+        valid_mask = steps.unsqueeze(0) < max_steps.unsqueeze(1)         # [B, n], all True here
 
         # Episode termination
         term = (self.dones[env.unsqueeze(1), seq_idx] |
@@ -372,7 +415,9 @@ class ParallelReplayBuffer:
             }
 
         # ----- sanity checks -----
-        if (batch_state['observation.state'].abs().max() > 1e5 or
+        if (
+            nstep_rewards.isnan().any() or
+            batch_state['observation.state'].abs().max() > 1e5 or
             batch_next_state['observation.state'].abs().max() > 1e5 or
             torch.isnan(batch_state['observation.state']).any() or
             torch.isnan(batch_next_state['observation.state']).any() or
@@ -651,15 +696,80 @@ class ParallelReplayBuffer:
         self.position[env_idx] = (self.position[env_idx] + 1) % self.capacity
         self.size[env_idx] = min(self.size[env_idx] + 1, self.capacity)
 
+    def _success_episode_num(self) -> int:
+        """Count the number of successful episodes in the buffer.
+        
+        An episode is considered successful if at least one frame has
+        complementary_info.success == 1.0 (or complementary_info.is_success == 1.0 for backward compatibility).
+        
+        Returns:
+            int: Number of successful episodes
+        """
+        if not self.initialized:
+            return 0
+        
+        total_success_episodes = 0
+        
+        # Check if complementary_info has success key (try both "success" and "is_success" for compatibility)
+        success_key = None
+        if self.has_complementary_info:
+            if "is_success" in self.complementary_info_keys:
+                success_key = "is_success"
+        
+        if success_key is None:
+            # If no success key, return 0 (no successful episodes by definition)
+            return 0
+        
+        # Iterate through all environments and count successful episodes
+        for env_idx in range(self.num_envs):
+            env_size = self.size[env_idx].item()
+            if env_size == 0:
+                continue
+            
+            # Track current episode
+            episode_is_success = False
+            
+            for frame_idx in range(env_size):
+                actual_idx = (self.position[env_idx] - env_size + frame_idx) % self.capacity
+                
+                # Check if this frame indicates success
+                if success_key in self.complementary_info:
+                    success_val = self.complementary_info[success_key][env_idx, actual_idx]
+                    if isinstance(success_val, torch.Tensor):
+                        if success_val.item() == 1.0:
+                            episode_is_success = True
+                    elif success_val == 1.0:
+                        episode_is_success = True
+                
+                # If we reached an episode boundary, check if it was successful
+                if self.dones[env_idx, actual_idx] or self.truncateds[env_idx, actual_idx]:
+                    if episode_is_success:
+                        total_success_episodes += 1
+                    
+                    # Reset for next episode
+                    episode_is_success = False
+        
+        return total_success_episodes
+
     def to_lerobot_dataset(
         self,
         repo_id: str,
         fps=1,
         root=None,
-        task_name="from_parallel_replay_buffer",
+        task_name:str = "Control robot to finish the task",
+        allowed_features: dict | None = None,
+        max_episodes: int = -1,
     ) -> LeRobotDataset:
         """
         Converts all transitions in this ParallelReplayBuffer into a single LeRobotDataset object.
+        
+        Args:
+            repo_id: Repository ID for the dataset
+            fps: Frames per second
+            root: Root directory for the dataset
+            task_name: Name of the task
+            allowed_features: Optional dict of allowed features. If provided, only these features
+                will be included in the dataset. Must be a subset of available features.
         """
         total_size = self.size.sum().item()
         if total_size == 0:
@@ -697,6 +807,18 @@ class ParallelReplayBuffer:
                     sample_val = sample_val.unsqueeze(0)
                 f_info = guess_feature_info(t=sample_val, name=f"complementary_info.{key}")
                 features[f"complementary_info.{key}"] = f_info
+
+        # Filter features if allowed_features is provided
+        if allowed_features is not None:
+            # Check that all allowed_features exist in this buffer's features
+            missing_features = set(allowed_features.keys()) - set(features.keys())
+            if missing_features:
+                raise ValueError(
+                    f"Missing required features in buffer: {missing_features}. "
+                    f"Available features: {list(features.keys())}"
+                )
+            # Use only allowed features
+            features = {k: v for k, v in features.items() if k in allowed_features}
 
         # Create an empty LeRobotDataset
         lerobot_dataset = LeRobotDataset.create(
@@ -752,6 +874,17 @@ class ParallelReplayBuffer:
                         else:
                             frame_dict[f"complementary_info.{key}"] = val
 
+                # Filter frame_dict to only include allowed features if specified
+                # Note: Always preserve required metadata fields like "task" even if not in allowed_features
+                if allowed_features is not None:
+                    # Preserve required metadata fields that may not be in feature schema
+                    required_metadata_fields = {"task"}  # LeRobotDataset requires this field
+                    preserved_fields = {k: v for k, v in frame_dict.items() if k in required_metadata_fields}
+                    # Filter to only allowed features
+                    filtered_dict = {k: v for k, v in frame_dict.items() if k in allowed_features}
+                    # Merge preserved fields back
+                    frame_dict = {**filtered_dict, **preserved_fields}
+
                 # Check if this frame indicates success
                 if 'complementary_info.is_success' in frame_dict:
                     success_val = frame_dict['complementary_info.is_success']
@@ -770,6 +903,10 @@ class ParallelReplayBuffer:
                             global_frame_idx += 1
                         lerobot_dataset.save_episode()
                         episode_idx += 1
+                        if max_episodes > 0 and episode_idx >= max_episodes:
+                            lerobot_dataset.stop_image_writer()
+                            lerobot_dataset.finalize()
+                            return lerobot_dataset
                         print(f"Saved successful episode {episode_idx} with {len(current_episode_frames)} frames")
                     
                     # Reset for next episode
@@ -779,6 +916,9 @@ class ParallelReplayBuffer:
         #! note: remaining frames will be discarded
 
         lerobot_dataset.stop_image_writer()
+        # CRITICAL: finalize() must be called to close parquet writers and write metadata footers
+        # Without this, parquet files will be corrupted/incomplete and cannot be loaded
+        lerobot_dataset.finalize()
 
         return lerobot_dataset
 

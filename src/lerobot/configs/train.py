@@ -181,7 +181,28 @@ class TrainPipelineConfig(HubMixin):
             return draccus.parse(cls, config_file, args=cli_args)
 
 
+@dataclass
+class OfflineStageConfig:
+    """Configuration for iterative offline RL stage."""
+    iters: int = 10
+    iql_steps: int = 5000
+    bc_steps_after_merge: int = 2000
+    sync_critic_encoder_after_bc: bool = False # enforce sync critic encoder with actor encoder after BC finetuning
+    success_keep_ratio: float = 1.0
+    ope_adaptive_threshold_fraction: float = 0.05
+    pretrain_path: str | None = None
+    ope_num_samples: int = 5000 # number of samples to draw from the buffer for OPE
+    max_ope_iterations: int = 5 # after n iterations, the policy is accepted even if the improvement is less than the threshold
+    max_online_episodes_added_per_iter: int = 50 # maximum number of online episodes to add to the offline buffer per iteration
+
 @dataclass(kw_only=True)
 class TrainRLServerPipelineConfig(TrainPipelineConfig):
     dataset: DatasetConfig | None = None  # NOTE: In RL, we don't need an offline dataset
     resume_from_output_dir: Path | None = None
+    offline: OfflineStageConfig = field(default_factory=OfflineStageConfig)
+    
+    ope_eval_env: envs.EnvConfig | None = None
+
+    # device
+    actor_device: str = "cuda"
+    learner_device: str = "cuda"

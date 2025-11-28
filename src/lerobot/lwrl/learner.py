@@ -383,7 +383,7 @@ def add_actor_information_and_train(
         )
 
         # Wait until the replay buffer has enough samples to start training
-        if len(replay_buffer) < online_step_before_learning:
+        if len(replay_buffer) / cfg.env.num_envs < online_step_before_learning:
             continue
 
         if online_iterator is None:
@@ -970,6 +970,9 @@ def initialize_replay_buffer(
         ReplayBuffer: Initialized replay buffer
     """
     # try to load (sometimes we don't save dataset to save space)
+    if not hasattr(cfg.env, "num_envs"):
+        cfg.env.num_envs = 1 # roll back to single environment
+    
     if cfg.resume:
         logging.info("Resume training load the online dataset")
         dataset_path = os.path.join(cfg.output_dir, "dataset")
@@ -1013,7 +1016,8 @@ def initialize_offline_replay_buffer(
     cfg: TrainRLServerPipelineConfig,
     device: str,
     storage_device: str,
-) -> ReplayBuffer:
+    return_features: bool = False,
+) -> ParallelReplayBuffer:
     """
     Initialize an offline replay buffer from a dataset.
 
@@ -1042,15 +1046,19 @@ def initialize_offline_replay_buffer(
 
 
     logging.info("Convert to a offline replay buffer")
-    offline_replay_buffer = ReplayBuffer.from_lerobot_dataset(
+    offline_replay_buffer = ParallelReplayBuffer.from_lerobot_dataset(
         offline_dataset,
         device=device,
         state_keys=cfg.policy.input_features.keys(),
         storage_device=storage_device,
         optimize_memory=True,
+        num_envs=1,
         capacity=cfg.policy.offline_buffer_capacity,
     )
-    return offline_replay_buffer
+    if return_features:
+        return offline_replay_buffer, offline_dataset.meta.info["features"]
+    else:
+        return offline_replay_buffer
 
 
 # Utilities/Helpers functions
