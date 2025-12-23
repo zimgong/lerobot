@@ -16,7 +16,7 @@
         "disable_artifact": true
     },
     "dataset": {
-        "root": "/home/zimu.gong/.cache/huggingface/lerobot/zimgong/LSPickUpBlackBowlBetweenPlateAndRamekinAndPlaceItOnPlate/lerobot_v30",
+        "root": "/home/zimu.gong/.cache/huggingface/lerobot/zimgong/LSPickUpBlackBowlBetweenPlateAndRamekinAndPlaceItOnPlate/processed",
         "repo_id": "LSPickUpBlackBowlBetweenPlateAndRamekinAndPlaceItOnPlate",
         "use_imagenet_stats": false
     },
@@ -283,7 +283,7 @@
         "teleop": null,
         "processor": {
             "OBS_STATE_KEYS": ["joint_pos"],
-            "CAMERA_KEYS": ["left_hand_camera", "first_person_camera", "right_hand_camera"],
+            "CAMERA_KEYS": ["left_hand_camera_rgb", "first_person_camera_rgb", "right_hand_camera_rgb"],
 
             "control_mode": "gamepad",
             "reset": {
@@ -294,7 +294,7 @@
             }
         },
         "features": {
-            "observation.images.left_hand": {
+            "observation.images.left_hand_camera_rgb": {
                 "type": "VISUAL",
                 "shape": [
                     3,
@@ -302,7 +302,7 @@
                     128
                 ]
             },
-            "observation.images.first_person": {
+            "observation.images.first_person_camera_rgb": {
                 "type": "VISUAL",
                 "shape": [
                     3,
@@ -310,7 +310,7 @@
                     128
                 ]
             },
-            "observation.images.right_hand": {
+            "observation.images.right_hand_camera_rgb": {
                 "type": "VISUAL",
                 "shape": [
                     3,
@@ -332,9 +332,9 @@
             }
         },
         "features_map": {
-            "observation.images.left_hand": "observation.images.left_hand",
-            "observation.images.first_person": "observation.images.first_person",
-            "observation.images.right_hand": "observation.images.right_hand",
+            "observation.images.left_hand_camera_rgb": "observation.images.left_hand",
+            "observation.images.first_person_camera_rgb": "observation.images.first_person",
+            "observation.images.right_hand_camera_rgb": "observation.images.right_hand",
             "observation.state": "observation.state",
             "action": "action"
         }
