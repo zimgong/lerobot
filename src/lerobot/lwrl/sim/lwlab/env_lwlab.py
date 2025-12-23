@@ -28,11 +28,40 @@ def make_lwlab_robot_env(cfg: HILSerlRobotEnvConfig) -> tuple[gym.Env, Any]:
     # Check if this is a GymHIL simulation environment
     assert cfg.type == "lwlab", "LwLab environment must be provided"
 
-    from lwlab.distributed.proxy import RemoteEnv
     from torch import multiprocessing as mp
     mp.set_start_method("fork", force=True)
 
+    from lw_benchhub.utils.config_loader import config_loader
+    from lw_benchhub.distributed.proxy import RemoteEnv
+    from lw_benchhub.distributed.restful import DotDict
+
     env = RemoteEnv.make(address=(cfg.address, cfg.port), authkey=bytes(cfg.authkey, 'utf-8'))
+    yaml_args = config_loader.load(cfg.task)
+    env_cfg = DotDict(yaml_args.__dict__)
+    defaults = {
+        "scene_backend": "robocasa",
+        "task_backend": "robocasa",
+        "device": "cuda:0",
+        "robot_scale": 1.0,
+        "first_person_view": False,
+        "disable_fabric": False,
+        "num_envs": 1,
+        "usd_simplify": False,
+        "video": False,
+        "for_rl": False,
+        "variant": "Visual",
+        "concatenate_terms": False,
+        "distributed": False,
+        "seed": 42,
+        "sources": None,
+        "object_projects": None,
+        "execute_mode": "eval",
+        "replay_cfgs": {"add_camera_to_observation": True},
+    }
+    for key, value in defaults.items():
+        if key not in env_cfg:
+            env_cfg[key] = value
+    env.attach(env_cfg)
     env = env.unwrapped
     env.reset()
 

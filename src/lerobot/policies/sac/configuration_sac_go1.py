@@ -20,78 +20,36 @@ from dataclasses import dataclass, field
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import NormalizationMode
 from lerobot.optim.optimizers import MultiAdamConfig
+from lerobot.policies.sac.configuration_sac import (
+    is_image_feature,
+    ConcurrencyConfig,
+    ActorLearnerConfig,
+    CriticNetworkConfig,
+    ActorNetworkConfig,
+    PolicyConfig,
+)
 from lerobot.utils.constants import ACTION, OBS_IMAGE, OBS_STATE
 
+from go1.configs.go1_base_cfg import BaseModelArguments
+from go1.tools.env_parse import get_bool_env
 
-def is_image_feature(key: str) -> bool:
-    """Check if a feature key represents an image feature.
-
-    Args:
-        key: The feature key to check
-
-    Returns:
-        True if the key represents an image feature, False otherwise
-    """
-    return key.startswith(OBS_IMAGE)
+DEBUG_MODE = get_bool_env("DEBUG_MODE")
 
 
 @dataclass
-class ConcurrencyConfig:
-    """Configuration for the concurrency of the actor and learner.
-    Possible values are:
-    - "threads": Use threads for the actor and learner.
-    - "processes": Use processes for the actor and learner.
-    """
-
-    actor: str = "threads"
-    learner: str = "threads"
+class GOModelArguments(BaseModelArguments):
+    model_name_or_path: str = field(default="agibot-world/GO-1-Air")
+    freeze_llm: bool = field(default=False if not DEBUG_MODE else True)
+    freeze_backbone: bool = field(default=False if not DEBUG_MODE else True)
+    freeze_mlp: bool = field(default=False if not DEBUG_MODE else True)
+    action_chunk_size: int = field(default=10)
+    latent_planning: bool = field(default=False)    
 
 
+@PreTrainedConfig.register_subclass("sac_go1")
 @dataclass
-class ActorLearnerConfig:
-    learner_host: str = "127.0.0.1"
-    learner_port: int = 50051
-    policy_parameters_push_frequency: int = 4
-    queue_get_timeout: float = 2
-
-
-@dataclass
-class CriticNetworkConfig:
-    hidden_dims: list[int] = field(default_factory=lambda: [256, 256])
-    activate_final: bool = True
-    final_activation: str | None = None
-
-
-@dataclass
-class ActorNetworkConfig:
-    hidden_dims: list[int] = field(default_factory=lambda: [256, 256])
-    activate_final: bool = True
-
-
-@dataclass
-class PolicyConfig:
-    use_tanh_squash: bool = True
-    std_min: float = 1e-5
-    std_max: float = 10.0
-    init_final: float = 0.05
-    action_low_bound: list[float] = field(default_factory=lambda: None)
-    action_high_bound: list[float] = field(default_factory=lambda: None)
-
-
-@PreTrainedConfig.register_subclass("sac")
-@PreTrainedConfig.register_subclass("sac_flowrl")
-@dataclass
-class SACConfig(PreTrainedConfig):
-    """Soft Actor-Critic (SAC) configuration.
-
-    SAC is an off-policy actor-critic deep RL algorithm based on the maximum entropy
-    reinforcement learning framework. It learns a policy and a Q-function simultaneously
-    using experience collected from the environment.
-
-    This configuration class contains all the parameters needed to define a SAC agent,
-    including network architectures, optimization settings, and algorithm-specific
-    hyperparameters.
-    """
+class SACGO1Config(PreTrainedConfig):
+    """Soft Actor-Critic (SAC) with AgiBot GO-1 configuration."""
 
     # Mapping of feature types to normalization modes
     normalization_mapping: dict[str, NormalizationMode] = field(
@@ -121,6 +79,20 @@ class SACConfig(PreTrainedConfig):
         }
     )
 
+    # Arguments for obs / action space
+    space_repack: dict = field(
+        default_factory=lambda: {
+            "state": "state",
+            "action": "action",
+            "cam_head_color": "cam_head_color",
+            "cam_hand_left_color": "cam_hand_left_color",
+            "cam_hand_right_color": "cam_hand_right_color",
+            "final_prompt": "final_prompt",
+        }
+    )
+    ctrl_freq: int = field(default=30)
+    default_prompt: str = field(default="your instruction here")
+
     # Architecture specifics
     # Device to run the model on (e.g., "cuda", "cpu")
     device: str = "cpu"
@@ -130,8 +102,6 @@ class SACConfig(PreTrainedConfig):
     vision_encoder_name: str | None = None
     # Whether to freeze the vision encoder during training
     freeze_vision_encoder: bool = True
-    # Hidden dimension size for the image encoder
-    image_encoder_hidden_dim: int = 32
     # Whether to use a shared encoder for actor and critic
     shared_encoder: bool = True
     # Number of discrete actions, eg for gripper actions
@@ -186,6 +156,8 @@ class SACConfig(PreTrainedConfig):
     grad_clip_norm: float = 40.0
 
     # Network configuration
+    # Configuration for the GO-1 model
+    go1_model_kwargs: GOModelArguments = field(default_factory=GOModelArguments)
     # Configuration for the critic network architecture
     critic_network_kwargs: CriticNetworkConfig = field(default_factory=CriticNetworkConfig)
     # Configuration for the actor network architecture
@@ -201,21 +173,6 @@ class SACConfig(PreTrainedConfig):
 
     # Optimizations
     use_torch_compile: bool = True
-
-    # Buffer
-    n_steps: int = 1 # n-step returns
-
-    # FlowRL parameters
-    flow_rl_enabled: bool = False
-    flowrl_expectile_tau: float = 0.9 # expectile regression for V*: stop-grad on Q* (Eq. 18)
-    flow_rl_bc_weight: float = 0.1 # weighted BC (exploitation)
-    flow_rl_qv_weight: float = 1.0 # critic loss = ori_critic_loss + flow_rl_qv_weight * (v_loss + q_loss_star)
-    
-    # FlowRL gradient projection parameters
-    flowrl_gradproj_enabled: bool = False # enable gradient projection for actor loss
-    flowrl_gradproj_mode: str = "bc_on_rl_orth" # projection mode: "bc_on_rl_orth" or "mutual"
-    flowrl_gradproj_conflict_cos_thresh: float = 0.0 # cosine threshold for conflict detection
-    flowrl_gradproj_eps: float = 1e-12 # numerical stability epsilon
 
     def __post_init__(self):
         super().__post_init__()

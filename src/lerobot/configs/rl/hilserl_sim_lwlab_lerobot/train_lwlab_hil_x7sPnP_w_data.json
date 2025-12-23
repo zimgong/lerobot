@@ -1,0 +1,342 @@
+{    
+    "output_dir": null,
+    "job_name": "lwlab_x7s_pickup_20env_50episodes",
+    "resume": false,
+    "seed": 1000,
+    "num_workers": 4,
+    "batch_size": 256,
+    "steps": 200000,
+    "log_freq": 1,
+    "save_checkpoint": true,
+    "save_freq": 2500,
+    "wandb": {
+        "enable": false,
+        "mode": "online",
+        "project": "lwlab_sim",
+        "disable_artifact": true
+    },
+    "dataset": {
+        "root": "/home/zimu.gong/.cache/huggingface/lerobot/zimgong/LSPickUpBlackBowlBetweenPlateAndRamekinAndPlaceItOnPlate/lerobot_v30",
+        "repo_id": "LSPickUpBlackBowlBetweenPlateAndRamekinAndPlaceItOnPlate",
+        "use_imagenet_stats": false
+    },
+    "policy": {
+        "type": "sac",
+        "n_obs_steps": 1,
+        "repo_id": "hf_username/policy_name",
+        "normalization_mapping": {
+            "VISUAL": "MEAN_STD",
+            "STATE": "MIN_MAX",
+            "ENV": "MIN_MAX",
+            "ACTION": "MIN_MAX"
+        },
+        "input_features": {
+            "observation.images.left_hand": {
+                "type": "VISUAL",
+                "shape": [
+                    3,
+                    128,
+                    128
+                ]
+            },
+            "observation.images.first_person": {
+                "type": "VISUAL",
+                "shape": [
+                    3,
+                    128,
+                    128
+                ]
+            },
+            "observation.images.right_hand": {
+                "type": "VISUAL",
+                "shape": [
+                    3,
+                    128,
+                    128
+                ]
+            },
+            "observation.state": {
+                "type": "STATE",
+                "shape": [
+                    25
+                ]
+            }
+        },
+        "output_features": {
+            "action": {
+                "type": "ACTION",
+                "shape": [
+                    23
+                ]
+            }
+        },
+        "device": "cuda",
+        "use_amp": false,
+        "dataset_stats": {
+            "observation.images.left_hand": {
+                "mean": [
+                    0.485,
+                    0.456,
+                    0.406
+                ],
+                "std": [
+                    0.229,
+                    0.169,
+                    0.166
+                ]
+            },
+            "observation.images.first_person": {
+                "mean": [
+                    0.485,
+                    0.456,
+                    0.406
+                ],
+                "std": [
+                    0.229,
+                    0.169,
+                    0.166
+                ]
+            },
+            "observation.images.right_hand": {
+                "mean": [
+                    0.485,
+                    0.456,
+                    0.406
+                ],
+                "std": [
+                    0.229,
+                    0.169,
+                    0.166
+                ]
+            },
+            "observation.state": {
+                "min": [
+                    -0.12450199574232101,
+                    -0.36298590898513794,
+                    -0.001691647106781602,
+                    0.4988715350627899,
+                    -0.0936296358704567,
+                    -0.3233080506324768,
+                    -0.00048008590238168836,
+                    -0.5888503193855286,
+                    0.0,
+                    -0.0075139799155294895,
+                    -1.24677574634552,
+                    -1.7191380262374878,
+                    -0.341433048248291,
+                    -1.0281181335449219,
+                    -0.43069079518318176,
+                    -0.9391257166862488,
+                    -1.0271317958831787,
+                    -0.6775878667831421,
+                    -1.2811896800994873,
+                    -1.2488999366760254,
+                    -1.1121060848236084,
+                    -0.03576001897454262,
+                    -0.036939587444067,
+                    0.043498408049345016,
+                    0.04320055618882179
+                ],
+                "max": [
+                    0.3287724554538727,
+                    0.00025805007317103446,
+                    0.0009193932637572289,
+                    0.5400000214576721,
+                    1.3509625205188058e-05,
+                    1.4847701787948608,
+                    0.00014794008166063577,
+                    0.29512351751327515,
+                    1.4570423364639282,
+                    0.004064428620040417,
+                    0.0,
+                    0.9775546789169312,
+                    0.3848508894443512,
+                    1.3090476989746094,
+                    1.0435198545455933,
+                    1.3252017498016357,
+                    0.21450480818748474,
+                    1.5080206394195557,
+                    0.4838118553161621,
+                    1.1973259449005127,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.04399999976158142,
+                    0.04399999976158142
+                ]
+            }
+        },
+        "storage_device": "cpu",
+        "vision_encoder_name": "helper2424/resnet10",
+        "freeze_vision_encoder": true,
+        "image_encoder_hidden_dim": 32,
+        "shared_encoder": true,
+        "online_steps": 1000000,
+        "online_buffer_capacity": 100000,
+        "offline_buffer_capacity": 70000,
+        "online_step_before_learning": 100,
+        "policy_update_freq": 1,
+        "discount": 0.97,
+        "n_steps": 3,
+        "temperature_init": 0.01,
+        "num_critics": 2,
+        "num_subsample_critics": null,
+        "critic_lr": 0.0001,
+        "actor_lr": 0.00001,
+        "temperature_lr": 0.0003,
+        "critic_target_update_weight": 0.005,
+        "utd_ratio": 2,
+        "state_encoder_hidden_dim": 256,
+        "latent_dim": 64,
+        "target_entropy": null,
+        "use_backup_entropy": true,
+        "grad_clip_norm": 1.0,
+        "num_discrete_actions": null,
+        "critic_network_kwargs": {
+            "hidden_dims": [
+                256,
+                256
+            ],
+            "activate_final": true,
+            "final_activation": null
+        },
+        "actor_network_kwargs": {
+            "hidden_dims": [
+                256,
+                256
+            ],
+            "activate_final": true
+        },
+        "policy_kwargs": {
+            "use_tanh_squash": true,
+            "std_min": 1e-5,
+            "std_max": 2,
+            "init_final": 0.05,
+            "action_low_bound": [
+                -0.0027382513508200645,
+                -0.004999999888241291,
+                0.0,
+                -0.0003991350531578064,
+                -0.0062500000931322575,
+                -0.5989447236061096,
+                -1.449143409729004,
+                -0.4178474545478821,
+                -0.4836432635784149,
+                -1.0599368810653687,
+                -1.3002290725708008,
+                -1.3271567821502686,
+                -0.7838338613510132,
+                4.0284445276483893e-05,
+                -1.7766895294189453,
+                -1.0471508502960205,
+                -1.0315675735473633,
+                -0.7850332856178284,
+                -1.2765686511993408,
+                0.04399999976158142,
+                0.04399999976158142,
+                -0.03999999910593033,
+                -0.03999999910593033
+            ],
+            "action_high_bound": [
+                0.004999999888241291,
+                0.00035156248486600816,
+                0.0,
+                0.0012500000884756446,
+                0.00045698328176513314,
+                0.46133360266685486,
+                -6.587042298633605e-05,
+                0.40352627635002136,
+                1.0466890335083008,
+                0.21613237261772156,
+                0.565943717956543,
+                0.01462542824447155,
+                1.5132756233215332,
+                1.5707272291183472,
+                1.0003931522369385,
+                1.3088277578353882,
+                1.3471821546554565,
+                1.5652546882629395,
+                1.5705196857452393,
+                0.04399999976158142,
+                0.04399999976158142,
+                -0.0,
+                -0.0
+            ]
+        },
+        "actor_learner_config": {
+            "learner_host": "127.0.0.1",
+            "learner_port": 50051,
+            "policy_parameters_push_frequency": 10
+        },
+        "concurrency": {
+            "actor": "threads",
+            "learner": "threads"
+        }
+    },
+    "env": {
+        "type": "lwlab",
+        "name": "lwlab_sim",
+        "task": "env_server_x7s_liftobj",
+        "num_envs": 20,
+        "fps": 30,
+        "robot": null,
+        "teleop": null,
+        "processor": {
+            "OBS_STATE_KEYS": ["joint_pos"],
+            "CAMERA_KEYS": ["left_hand_camera", "first_person_camera", "right_hand_camera"],
+
+            "control_mode": "gamepad",
+            "reset": {
+                "fixed_reset_joint_positions": null,
+                "reset_time_s": 2.0,
+                "control_time_s": 15.0,
+                "terminate_on_success": true
+            }
+        },
+        "features": {
+            "observation.images.left_hand": {
+                "type": "VISUAL",
+                "shape": [
+                    3,
+                    128,
+                    128
+                ]
+            },
+            "observation.images.first_person": {
+                "type": "VISUAL",
+                "shape": [
+                    3,
+                    128,
+                    128
+                ]
+            },
+            "observation.images.right_hand": {
+                "type": "VISUAL",
+                "shape": [
+                    3,
+                    128,
+                    128
+                ]
+            },
+            "observation.state": {
+                "type": "STATE",
+                "shape": [
+                    25
+                ]
+            },
+            "action": {
+                "type": "ACTION",
+                "shape": [
+                    23
+                ]
+            }
+        },
+        "features_map": {
+            "observation.images.left_hand": "observation.images.left_hand",
+            "observation.images.first_person": "observation.images.first_person",
+            "observation.images.right_hand": "observation.images.right_hand",
+            "observation.state": "observation.state",
+            "action": "action"
+        }
+    }
+}

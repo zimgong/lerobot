@@ -52,13 +52,17 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from pprint import pformat
 from tqdm import tqdm
+from typing import Callable
 
 import grpc
 import torch
+import torch.distributed as dist
 from termcolor import colored
 from torch import nn
 from torch.multiprocessing import Queue
+from torch.nn.parallel import DistributedDataParallel
 from torch.optim.optimizer import Optimizer
+from accelerate import PartialState
 
 from lerobot.cameras import opencv  # noqa: F401
 from lerobot.configs import parser
@@ -88,6 +92,7 @@ from lerobot.utils.constants import (
     PRETRAINED_MODEL_DIR,
     TRAINING_STATE_DIR,
 )
+from lerobot.utils.dist_utils import init_dist
 from lerobot.utils.random_utils import set_seed
 from lerobot.utils.train_utils import (
     get_step_checkpoint_dir,
@@ -132,6 +137,12 @@ def train(cfg: TrainRLServerPipelineConfig, job_name: str | None = None):
 
     cfg.validate()
 
+    init_dist(launcher="pytorch", backend="nccl")
+    distributed_state = PartialState()
+
+    if distributed_state.device is not None:
+        cfg.policy.device = str(distributed_state.device)
+
     if job_name is None:
         job_name = cfg.job_name
 
@@ -153,7 +164,7 @@ def train(cfg: TrainRLServerPipelineConfig, job_name: str | None = None):
     logging.info(pformat(cfg.to_dict()))
 
     # Setup WandB logging if enabled
-    if cfg.wandb.enable and cfg.wandb.project:
+    if cfg.wandb.enable and cfg.wandb.project and distributed_state.is_main_process:
         from lerobot.rl.wandb_utils import WandBLogger
 
         wandb_logger = WandBLogger(cfg)
@@ -176,6 +187,7 @@ def train(cfg: TrainRLServerPipelineConfig, job_name: str | None = None):
         cfg=cfg,
         wandb_logger=wandb_logger,
         shutdown_event=shutdown_event,
+        distributed_state=distributed_state,
     )
 
 
@@ -183,6 +195,7 @@ def start_learner_threads(
     cfg: TrainRLServerPipelineConfig,
     wandb_logger: WandBLogger | None,
     shutdown_event: any,  # Event,
+    distributed_state: PartialState,
 ) -> None:
     """
     Start the learner threads for training.
@@ -191,11 +204,14 @@ def start_learner_threads(
         cfg (TrainRLServerPipelineConfig): Training configuration
         wandb_logger (WandBLogger | None): Logger for metrics
         shutdown_event: Event to signal shutdown
+        distributed_state (PartialState): Distributed state information
     """
     # Create multiprocessing queues
-    transition_queue = Queue()
-    interaction_message_queue = Queue()
-    parameters_queue = Queue()
+    is_main_rank = not distributed_state.use_distributed or distributed_state.is_main_process
+    transition_queue = Queue() if is_main_rank else None
+    interaction_message_queue = Queue() if is_main_rank else None
+    parameters_queue = Queue() if is_main_rank else None
+    # If distributed, only the main rank handles the queues
 
     concurrency_entity = None
 
@@ -208,18 +224,20 @@ def start_learner_threads(
 
         concurrency_entity = Process
 
-    communication_process = concurrency_entity(
-        target=start_learner,
-        args=(
-            parameters_queue,
-            transition_queue,
-            interaction_message_queue,
-            shutdown_event,
-            cfg,
-        ),
-        daemon=True,
-    )
-    communication_process.start()
+    communication_process = None
+    if is_main_rank:
+        communication_process = concurrency_entity(
+            target=start_learner,
+            args=(
+                parameters_queue,
+                transition_queue,
+                interaction_message_queue,
+                shutdown_event,
+                cfg,
+            ),
+            daemon=True,
+        )
+        communication_process.start()
 
     add_actor_information_and_train(
         cfg=cfg,
@@ -228,23 +246,25 @@ def start_learner_threads(
         transition_queue=transition_queue,
         interaction_message_queue=interaction_message_queue,
         parameters_queue=parameters_queue,
+        distributed_state=distributed_state,
     )
     logging.info("[LEARNER] Training process stopped")
 
-    logging.info("[LEARNER] Closing queues")
-    transition_queue.close()
-    interaction_message_queue.close()
-    parameters_queue.close()
+    if is_main_rank:
+        logging.info("[LEARNER] Closing queues")
+        transition_queue.close()
+        interaction_message_queue.close()
+        parameters_queue.close()
 
-    communication_process.join()
-    logging.info("[LEARNER] Communication process joined")
+        communication_process.join()
+        logging.info("[LEARNER] Communication process joined")
 
-    logging.info("[LEARNER] join queues")
-    transition_queue.cancel_join_thread()
-    interaction_message_queue.cancel_join_thread()
-    parameters_queue.cancel_join_thread()
+        logging.info("[LEARNER] join queues")
+        transition_queue.cancel_join_thread()
+        interaction_message_queue.cancel_join_thread()
+        parameters_queue.cancel_join_thread()
 
-    logging.info("[LEARNER] queues closed")
+        logging.info("[LEARNER] queues closed")
 
 
 # Core algorithm functions
@@ -257,6 +277,7 @@ def add_actor_information_and_train(
     transition_queue: Queue,
     interaction_message_queue: Queue,
     parameters_queue: Queue,
+    distributed_state: PartialState,
 ):
     """
     Handles data transfer from the actor to the learner, manages training updates,
@@ -281,10 +302,15 @@ def add_actor_information_and_train(
         transition_queue (Queue): Queue for receiving transitions from the actor.
         interaction_message_queue (Queue): Queue for receiving interaction messages from the actor.
         parameters_queue (Queue): Queue for sending policy parameters to the actor.
+        distributed_state (PartialState): Distributed state information.
     """
     # Extract all configuration variables at the beginning, it improve the speed performance
     # of 7%
-    device = get_safe_torch_device(try_device=cfg.policy.device, log=True)
+    is_main_rank = not distributed_state.use_distributed or distributed_state.is_main_process
+    if distributed_state.use_distributed:
+        device = distributed_state.device
+    else: 
+        device = get_safe_torch_device(try_device=cfg.policy.device, log=True)
     storage_device = get_safe_torch_device(try_device=cfg.policy.storage_device)
     clip_grad_norm_value = cfg.policy.grad_clip_norm
     online_step_before_learning = cfg.policy.online_step_before_learning
@@ -297,6 +323,7 @@ def add_actor_information_and_train(
     saving_checkpoint = cfg.save_checkpoint
     online_steps = cfg.policy.online_steps
     async_prefetch = cfg.policy.async_prefetch
+    critic_step_before_actor = cfg.policy.critic_step_before_actor
 
     # Initialize logging for multiprocessing
     if not use_threads(cfg):
@@ -314,10 +341,27 @@ def add_actor_information_and_train(
     )
 
     assert isinstance(policy, nn.Module)
+    observation_preprocessor = getattr(policy, "observation_preprocessor", None)
 
     policy.train()
 
-    push_actor_policy_to_queue(parameters_queue=parameters_queue, policy=policy)
+    if is_main_rank:
+        push_actor_policy_to_queue(parameters_queue=parameters_queue, policy=policy)
+    
+    if distributed_state.use_distributed:
+        ddp_kwargs: dict[str, any] = {
+            "broadcast_buffers": False,
+            "find_unused_parameters": True,  # Required because SAC uses different model types in separate forward passes
+        }
+        if device.type == "cuda":
+            assert device.index is not None
+            ddp_kwargs["device_ids"] = [device.index]
+            ddp_kwargs["output_device"] = device.index
+        policy_module = DistributedDataParallel(module=policy, **ddp_kwargs)
+        policy_module.train()
+        policy = policy_module.module
+    else:
+        policy_module = policy
 
     last_time_policy_pushed = time.time()
 
@@ -328,7 +372,13 @@ def add_actor_information_and_train(
 
     log_training_info(cfg=cfg, policy=policy)
 
-    replay_buffer = initialize_replay_buffer(cfg, device, storage_device)
+    # Ensure that the main rank initializes the replay buffer first because 
+    # other buffers rely on the main rank to create shared memory. 
+    if distributed_state.use_distributed and not is_main_rank:
+        dist.barrier()
+    replay_buffer = initialize_replay_buffer(cfg, device, storage_device, observation_preprocessor)
+    if distributed_state.use_distributed and is_main_rank:
+        dist.barrier()
     batch_size = cfg.batch_size
     offline_replay_buffer = None
 
@@ -337,6 +387,7 @@ def add_actor_information_and_train(
             cfg=cfg,
             device=device,
             storage_device=storage_device,
+            preprocessor=observation_preprocessor,
         )
         batch_size: int = batch_size // 2  # We will sample from both replay buffer
 
@@ -362,25 +413,37 @@ def add_actor_information_and_train(
         # Exit the training loop if shutdown is requested
         if shutdown_event is not None and shutdown_event.is_set():
             logging.info("[LEARNER] Shutdown signal received. Exiting...")
+            # Cleanup shared memory managers and destroy process group if distributed
+            if distributed_state.use_distributed:
+                if replay_buffer.shared_memory_manager:
+                    replay_buffer.shared_memory_manager.cleanup(distributed_state.process_index)
+                if offline_replay_buffer.shared_memory_manager:
+                    offline_replay_buffer.shared_memory_manager.cleanup(distributed_state.process_index)
+                try:
+                    dist.destroy_process_group()
+                    logging.info("[LEARNER] Destroyed process group")
+                except Exception as e:
+                    logging.warning(f"[LEARNER] Failed to destroy process group: {e}")
             break
 
-        # Process all available transitions to the replay buffer, send by the actor server
-        process_transitions(
-            transition_queue=transition_queue,
-            replay_buffer=replay_buffer,
-            offline_replay_buffer=offline_replay_buffer,
-            device=storage_device,
-            dataset_repo_id=dataset_repo_id,
-            shutdown_event=shutdown_event,
-        )
+        if is_main_rank:
+            # Process all available transitions to the replay buffer, send by the actor server
+            process_transitions(
+                transition_queue=transition_queue,
+                replay_buffer=replay_buffer,
+                offline_replay_buffer=offline_replay_buffer,
+                device=storage_device,
+                dataset_repo_id=dataset_repo_id,
+                shutdown_event=shutdown_event,
+            )
 
-        # Process all available interaction messages sent by the actor server
-        interaction_message = process_interaction_messages(
-            interaction_message_queue=interaction_message_queue,
-            interaction_step_shift=interaction_step_shift,
-            wandb_logger=wandb_logger,
-            shutdown_event=shutdown_event,
-        )
+            # Process all available interaction messages sent by the actor server
+            interaction_message = process_interaction_messages(
+                interaction_message_queue=interaction_message_queue,
+                interaction_step_shift=interaction_step_shift,
+                wandb_logger=wandb_logger,
+                shutdown_event=shutdown_event,
+            )
 
         # Wait until the replay buffer has enough samples to start training
         if len(replay_buffer) / cfg.env.num_envs < online_step_before_learning:
@@ -388,12 +451,12 @@ def add_actor_information_and_train(
 
         if online_iterator is None:
             online_iterator = replay_buffer.get_iterator(
-                batch_size=batch_size, async_prefetch=async_prefetch, queue_size=2
+                batch_size=batch_size, async_prefetch=async_prefetch, queue_size=16
             )
 
         if offline_replay_buffer is not None and offline_iterator is None:
             offline_iterator = offline_replay_buffer.get_iterator(
-                batch_size=batch_size, async_prefetch=async_prefetch, queue_size=2
+                batch_size=batch_size, async_prefetch=async_prefetch, queue_size=16
             )
 
         time_for_one_optimization_step = time.time()
@@ -431,7 +494,7 @@ def add_actor_information_and_train(
             }
 
             # Use the forward method for critic loss
-            critic_output = policy.forward(forward_batch, model="critic")
+            critic_output = policy_module.forward(forward_batch, model="critic")
 
             # Main critic optimization
             loss_critic = critic_output["loss_critic"]
@@ -444,7 +507,7 @@ def add_actor_information_and_train(
 
             # Discrete critic optimization (if available)
             if policy.config.num_discrete_actions is not None:
-                discrete_critic_output = policy.forward(forward_batch, model="discrete_critic")
+                discrete_critic_output = policy_module.forward(forward_batch, model="discrete_critic")
                 loss_discrete_critic = discrete_critic_output["loss_discrete_critic"]
                 optimizers["discrete_critic"].zero_grad()
                 loss_discrete_critic.backward()
@@ -488,13 +551,13 @@ def add_actor_information_and_train(
             "next_observation_feature": next_observation_features,
         }
 
-        critic_output = policy.forward(forward_batch, model="critic")
+        critic_output = policy_module.forward(forward_batch, model="critic")
 
         loss_critic = critic_output["loss_critic"]
 
         # TODO (sz): Debug this, find out why loss_critic is NaN
         if loss_critic.isnan():
-            policy.forward(forward_batch, model="critic")
+            policy_module.forward(forward_batch, model="critic")
             # import ipdb; ipdb.set_trace()
             raise ValueError("Loss critic is NaN")
 
@@ -514,7 +577,7 @@ def add_actor_information_and_train(
 
         # Discrete critic optimization (if available)
         if policy.config.num_discrete_actions is not None:
-            discrete_critic_output = policy.forward(forward_batch, model="discrete_critic")
+            discrete_critic_output = policy_module.forward(forward_batch, model="discrete_critic")
             loss_discrete_critic = discrete_critic_output["loss_discrete_critic"]
             optimizers["discrete_critic"].zero_grad()
             loss_discrete_critic.backward()
@@ -529,10 +592,12 @@ def add_actor_information_and_train(
             training_infos.update(discrete_critic_output.get("q_info", {}))
 
         # Actor and temperature optimization (at specified frequency)
-        if optimization_step % policy_update_freq == 0:
+        # Only train actor after specified number of critic steps
+        should_train_actor = critic_step_before_actor is None or optimization_step >= critic_step_before_actor
+        if should_train_actor and optimization_step % policy_update_freq == 0:
             for _ in range(policy_update_freq):
                 # Actor optimization
-                actor_output = policy.forward(forward_batch, model="actor")
+                actor_output = policy_module.forward(forward_batch, model="actor")
                 loss_actor = actor_output["loss_actor"]
                 optimizers["actor"].zero_grad()
                 loss_actor.backward()
@@ -550,7 +615,7 @@ def add_actor_information_and_train(
                     training_infos.update(policy._actor_proj_stats)
 
                 # Temperature optimization
-                temperature_output = policy.forward(forward_batch, model="temperature")
+                temperature_output = policy_module.forward(forward_batch, model="temperature")
                 loss_temperature = temperature_output["loss_temperature"]
                 optimizers["temperature"].zero_grad()
                 loss_temperature.backward()
@@ -568,7 +633,10 @@ def add_actor_information_and_train(
                 policy.update_temperature()
 
         # Push policy to actors if needed
-        if time.time() - last_time_policy_pushed > policy_parameters_push_frequency:
+        if (
+            is_main_rank
+            and time.time() - last_time_policy_pushed > policy_parameters_push_frequency
+        ):
             push_actor_policy_to_queue(parameters_queue=parameters_queue, policy=policy)
             last_time_policy_pushed = time.time()
 
@@ -576,7 +644,7 @@ def add_actor_information_and_train(
         policy.update_target_networks()
 
         # Log training metrics at specified intervals
-        if optimization_step % log_freq == 0:
+        if is_main_rank and optimization_step % log_freq == 0:
             training_infos["replay_buffer_size"] = len(replay_buffer)
             if offline_replay_buffer is not None:
                 training_infos["offline_replay_buffer_size"] = len(offline_replay_buffer)
@@ -591,7 +659,7 @@ def add_actor_information_and_train(
         frequency_for_one_optimization_step = 1 / (time_for_one_optimization_step + 1e-9)
 
         # Log optimization frequency
-        if wandb_logger:
+        if is_main_rank and wandb_logger:
             wandb_logger.log_dict(
                 {
                     "Optimization frequency loop [Hz]": frequency_for_one_optimization_step,
@@ -606,7 +674,7 @@ def add_actor_information_and_train(
             progress_bar.update(log_freq)
 
         # Save checkpoint at specified intervals
-        if saving_checkpoint and (optimization_step % save_freq == 0 or optimization_step == online_steps):
+        if is_main_rank and saving_checkpoint and (optimization_step % save_freq == 0 or optimization_step == online_steps):
             save_training_checkpoint(
                 cfg=cfg,
                 optimization_step=optimization_step,
@@ -956,7 +1024,7 @@ def log_training_info(cfg: TrainRLServerPipelineConfig, policy: nn.Module) -> No
 
 
 def initialize_replay_buffer(
-    cfg: TrainRLServerPipelineConfig, device: str, storage_device: str
+    cfg: TrainRLServerPipelineConfig, device: str, storage_device: str, preprocessor: Callable | None = None
 ) -> ReplayBuffer:
     """
     Initialize a replay buffer, either empty or from a dataset if resuming.
@@ -965,6 +1033,7 @@ def initialize_replay_buffer(
         cfg (TrainRLServerPipelineConfig): Training configuration
         device (str): Device to store tensors on
         storage_device (str): Device for storage optimization
+        preprocessor: Observation preprocessor (optional)
 
     Returns:
         ReplayBuffer: Initialized replay buffer
@@ -994,6 +1063,8 @@ def initialize_replay_buffer(
                 num_envs=cfg.env.num_envs,
                 gamma=cfg.policy.discount,
                 n_steps=cfg.policy.n_steps,
+                preprocessor=preprocessor,
+                buffer_name="online_replay_buffer",
             )
         except Exception as e:
             logging.error(f"Failed to load dataset: {e}")
@@ -1008,6 +1079,8 @@ def initialize_replay_buffer(
         num_envs=cfg.env.num_envs,
         gamma=cfg.policy.discount,
         n_steps=cfg.policy.n_steps,
+        preprocessor=preprocessor,
+        buffer_name="online_replay_buffer",
     )
     
 
@@ -1017,6 +1090,7 @@ def initialize_offline_replay_buffer(
     device: str,
     storage_device: str,
     return_features: bool = False,
+    preprocessor: Callable | None = None,
 ) -> ParallelReplayBuffer:
     """
     Initialize an offline replay buffer from a dataset.
@@ -1025,6 +1099,7 @@ def initialize_offline_replay_buffer(
         cfg (TrainRLServerPipelineConfig): Training configuration
         device (str): Device to store tensors on
         storage_device (str): Device for storage optimization
+        preprocessor: Observation preprocessor (optional)
 
     Returns:
         ReplayBuffer: Initialized offline replay buffer
@@ -1043,7 +1118,8 @@ def initialize_offline_replay_buffer(
 
     logging.info("make_dataset offline buffer")
     offline_dataset = make_dataset(cfg)
-
+    # Note: Use this config to fix a particular bug, remove when we solve it. 
+    offline_dataset.video_backend = "pyav"
 
     logging.info("Convert to a offline replay buffer")
     offline_replay_buffer = ParallelReplayBuffer.from_lerobot_dataset(
@@ -1054,6 +1130,8 @@ def initialize_offline_replay_buffer(
         optimize_memory=True,
         num_envs=1,
         capacity=cfg.policy.offline_buffer_capacity,
+        preprocessor=preprocessor,
+        buffer_name="offline_replay_buffer",
     )
     if return_features:
         return offline_replay_buffer, offline_dataset.meta.info["features"]

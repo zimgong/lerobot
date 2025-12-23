@@ -17,15 +17,131 @@
 import functools
 from collections.abc import Callable, Sequence
 from contextlib import suppress
+from multiprocessing import shared_memory
+import numpy as np
 from typing import TypedDict
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F  # noqa: N812
 from tqdm import tqdm
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.utils.constants import ACTION, DONE, OBS_IMAGE, REWARD
 from lerobot.utils.transition import Transition
+
+
+def _is_distributed() -> bool:
+    """Check if distributed training is enabled."""
+    return dist.is_available() and dist.is_initialized()
+
+
+def _get_distributed_info() -> tuple[int, int]:
+    """
+    Get rank and world_size for distributed training.
+    Returns (rank, world_size) or (0, 1) if not distributed.
+    """
+    if _is_distributed():
+        return dist.get_rank(), dist.get_world_size()
+    return 0, 1
+
+
+class SharedMemoryManager:
+    """
+    Helper class to manage shared memory blocks for distributed training.
+
+    This class handles creating shared memory blocks on rank 0 and attaching to them
+    on other ranks, allowing multiple processes to share the same buffer data.
+    """
+
+    def __init__(self, buffer_name: str = "replay_buffer"):
+        """
+        Initialize shared memory manager.
+
+        Args:
+            buffer_name: The name of the buffer to identify the buffer in shared memory.
+        """
+        self.buffer_name = buffer_name
+        self.shared_memories = {}  # Dict mapping tensor names to SharedMemory objects
+    
+    def _get_shared_name(self, tensor_name: str) -> str:
+        """Generate a unique shared nemory name for a tensor."""
+        return f"{self.buffer_name}_{tensor_name}"
+    
+    def create_shared_tensor(
+        self, tensor_name: str, shape: tuple, dtype: torch.dtype, rank: int
+    ) -> torch.Tensor:
+        """
+        Create a shared memory tensor. On rank 0, creates the shared memory block.
+        On other ranks, attaches to the existing memory block.
+
+        Args:
+            tensor_name: Name identifier for this tensor. 
+            shape: Shape of the tensor.
+            dtype: Data type of the tensor.
+            rank: Rank of the process.
+        Returns:
+            Shared memory tensor.
+        """
+        size_bytes = int(torch.prod(torch.tensor(shape)) * dtype.itemsize)
+        shared_name = self._get_shared_name(tensor_name)
+
+        if rank == 0:
+            try:
+                shm = shared_memory.SharedMemory(create=True, size=size_bytes, name=shared_name)
+                self.shared_memories[tensor_name] = shm
+            except FileExistsError:
+                shm = shared_memory.SharedMemory(name=shared_name)
+                shm.close()
+                shm.unlink()
+                shm = shared_memory.SharedMemory(create=True, size=size_bytes, name=shared_name)
+                self.shared_memories[tensor_name] = shm
+            
+            np_array = np.ndarray(shape, dtype=dtype, buffer=shm.buf)
+            tensor = torch.from_numpy(np_array)
+            tensor._shared_memory_np = np_array
+            tensor._shared_memory_shm = shm
+        else:
+            shm = shared_memory.SharedMemory(name=shared_name)
+            self.shared_memories[tensor_name] = shm
+            np_array = np.ndarray(shape, dtype=dtype, buffer=shm.buf)
+            tensor = torch.from_numpy(np_array)
+            tensor._shared_memory_np = np_array
+            tensor._shared_memory_shm = shm
+    
+    def broadcast_tensor_metadata(
+        self, tensor_metadata: dict[str, tuple[tuple, torch.dtype]], rank: int
+    ) -> dict[str, tuple[tuple, torch.dtype]]:
+        """
+        Broadcast tensor metadata from rank 0 to all other ranks.
+        """
+        if not dist.is_initialized():
+            return tensor_metadata
+        
+        if rank == 0:
+            metadata_list = []
+            for name, (shape, dtype) in tensor_metadata.items():
+                metadata_list.append((name, shape, dtype))
+            dist.broadcast_object_list(metadata_list, src=0)
+        else:
+            metadata_list = [None]
+            dist.broadcast_object_list(metadata_list, src=0)
+            metadata_list = metadata_list[0]
+            
+            tensor_metadata = {}
+            for name, shape, dtype in metadata_list:
+                tensor_metadata[name] = (shape, dtype)
+        return tensor_metadata
+
+    def cleanup(self, rank: int):
+        for tensor_name, shm in self.shared_memories.items():
+            shm.close()
+            if rank == 0:
+                try:
+                    shm.unlink()
+                except FileNotFoundError:
+                    pass  # Already unlinked
+        self.shared_memories.clear()
 
 
 class BatchTransition(TypedDict):
@@ -90,6 +206,8 @@ class ParallelReplayBuffer:
         optimize_memory: bool = False,
         gamma: float = 0.99,
         n_steps: int = 1,
+        preprocessor: Callable | None = None,
+        buffer_name: str = "replay_buffer",
     ):
         """
         Parallel replay buffer for storing transitions from multiple environments.
@@ -107,6 +225,8 @@ class ParallelReplayBuffer:
                 Using "cpu" can help save GPU memory.
             optimize_memory (bool): If True, optimizes memory by not storing duplicate next_states when
                 they can be derived from states. This is useful for large datasets where next_state[i] = state[i+1].
+            preprocessor: A function that takes a batch of transitions and returns a batch of preprocessed transitions.
+            buffer_name: The name of the buffer to identify the buffer in shared memory.
         """
         if capacity <= 0:
             raise ValueError("Capacity must be greater than 0.")
@@ -120,17 +240,37 @@ class ParallelReplayBuffer:
         self.num_envs = num_envs
         self.device = device
         self.storage_device = storage_device
-        # Position tracking for each environment: [num_envs]
-        self.position = torch.zeros(num_envs, dtype=torch.long, device=storage_device)
-        # Size tracking for each environment: [num_envs]
-        self.size = torch.zeros(num_envs, dtype=torch.long, device=storage_device)
+
+        rank, world_size = _get_distributed_info()
+        use_shared_memory = world_size > 1 and storage_device == torch.device("cpu")
+
+        if use_shared_memory:
+            self.shared_memory_manager = SharedMemoryManager(buffer_name=buffer_name)
+            self.position = self.shared_memory_manager.create_shared_tensor(
+                "position", (num_envs,), torch.long, rank
+            )
+            self.size = self.shared_memory_manager.create_shared_tensor(
+                "size", (num_envs,), torch.long, rank
+            )
+        else:
+            self.shared_memory_manager = None
+            # Position tracking for each environment: [num_envs]
+            self.position = torch.zeros(num_envs, dtype=torch.long, device=storage_device)
+            # Size tracking for each environment: [num_envs]
+            self.size = torch.zeros(num_envs, dtype=torch.long, device=storage_device)
         self.initialized = False
         self.optimize_memory = optimize_memory
         self.gamma = gamma
         self.n_steps = n_steps
+        self.preprocessor = preprocessor
 
         # Track episode boundaries for memory optimization: (num_envs, capacity)
-        self.episode_ends = torch.zeros((num_envs, capacity), dtype=torch.bool, device=storage_device)
+        if use_shared_memory:
+            self.episode_ends = self.shared_memory_manager.create_shared_tensor(
+                "episode_ends", (num_envs, capacity), torch.bool, rank
+            )
+        else:
+            self.episode_ends = torch.zeros((num_envs, capacity), dtype=torch.bool, device=storage_device)
 
         # If no state_keys provided, default to an empty list
         self.state_keys = state_keys if state_keys is not None else []
@@ -155,52 +295,203 @@ class ParallelReplayBuffer:
         complementary_info: dict[str, torch.Tensor] | None = None,
     ):
         """Initialize the storage tensors based on the first transition."""
-        # Determine shapes from the first transition
-        # For parallel buffer, we need to get the shape per environment (remove batch dimension)
-        state_shapes = {key: val[0].shape for key, val in state.items()}
-        action_shape = action[0].shape
-
-        # Pre-allocate tensors for storage with parallel dimension: (num_envs, capacity, ...)
-        self.states = {
-            key: torch.empty((self.num_envs, self.capacity, *value[0].shape), device=self.storage_device, dtype=value.dtype)
-            for key, value in state.items()
-        }
-        self.actions = torch.empty((self.num_envs, self.capacity, *action_shape), device=self.storage_device)
-        self.rewards = torch.empty((self.num_envs, self.capacity), device=self.storage_device)
-
-        if not self.optimize_memory:
-            # Standard approach: store states and next_states separately
-            self.next_states = {
-            key: torch.empty((self.num_envs, self.capacity, *value[0].shape), device=self.storage_device, dtype=value.dtype)
-            for key, value in state.items()
-            }
-        else:
-            # Memory-optimized approach: don't allocate next_states buffer
-            # Just create a reference to states for consistent API
-            self.next_states = self.states  # Just a reference for API consistency
-
-        self.dones = torch.empty((self.num_envs, self.capacity), dtype=torch.bool, device=self.storage_device)
-        self.truncateds = torch.empty((self.num_envs, self.capacity), dtype=torch.bool, device=self.storage_device)
-
-        # Initialize storage for complementary_info
-        self.has_complementary_info = complementary_info is not None
-        self.complementary_info_keys = []
-        self.complementary_info = {}
-
-        if self.has_complementary_info:
-            self.complementary_info_keys = list(complementary_info.keys())
-            # Pre-allocate tensors for each key in complementary_info
-            for key, value in complementary_info.items():
-                if isinstance(value, torch.Tensor):
-                    value_shape = value[0].shape
-                    self.complementary_info[key] = torch.empty(
-                        (self.num_envs, self.capacity, *value_shape), device=self.storage_device, dtype=value.dtype
+        rank, _ = _get_distributed_info()
+        
+        if self.shared_memory_manager:
+            if rank == 0:
+                state_shapes = {key: val.squeeze(0).shape for key, val in state.items()}
+                action_shape = action.squeeze(0).shape
+                
+                self.has_complementary_info = complementary_info is not None
+                self.complementary_info_keys = []
+                self.complementary_info = {}
+                if self.has_complementary_info:
+                    self.complementary_info_keys = list(complementary_info.keys())
+                self.states = {
+                    key: self.shared_memory_manager.create_shared_tensor(
+                        f"states_{key}", (self.num_envs, self.capacity, *shape), state[key].dtype, rank
                     )
-                elif isinstance(value, (int, float)):
-                    # Handle scalar values similar to reward
-                    self.complementary_info[key] = torch.empty((self.num_envs, self.capacity), device=self.storage_device)
+                    for key, shape in state_shapes.items()
+                }
+                self.actions = self.shared_memory_manager.create_shared_tensor(
+                    "actions", (self.num_envs, self.capacity, *action_shape), action.dtype, rank
+                )
+                self.rewards = self.shared_memory_manager.create_shared_tensor(
+                    "rewards", (self.num_envs, self.capacity), reward.dtype, rank
+                )
+                
+                if not self.optimize_memory:
+                    self.next_states = {
+                        key: self.shared_memory_manager.create_shared_tensor(
+                            f"next_states_{key}", (self.num_envs, self.capacity, *shape), state[key].dtype, rank
+                        )
+                        for key, shape in state_shapes.items()
+                    }
                 else:
-                    raise ValueError(f"Unsupported type {type(value)} for complementary_info[{key}]")
+                    self.next_states = self.states
+                
+                self.dones = self.shared_memory_manager.create_shared_tensor(
+                    "dones", (self.num_envs, self.capacity), torch.bool, rank
+                )
+                self.truncateds = self.shared_memory_manager.create_shared_tensor(
+                    "truncateds", (self.num_envs, self.capacity), torch.bool, rank
+                )
+                
+                if self.has_complementary_info:
+                    for key, value in complementary_info.items():
+                        if isinstance(value, torch.Tensor):
+                            self.complementary_info[key] = self.shared_memory_manager.create_shared_tensor(
+                                f"complementary_info_{key}", (self.num_envs, self.capacity, *value.shape), value.dtype, rank
+                            )
+                        elif isinstance(value, (int, float)):
+                            self.complementary_info[key] = self.shared_memory_manager.create_shared_tensor(
+                                f"complementary_info_{key}", (self.num_envs, self.capacity), value.dtype, rank
+                            )
+                        else:
+                            raise ValueError(f"Unsupported type {type(value)} for complementary_info[{key}]")
+                
+                tensor_metadata = {}
+                for key in state_shapes:
+                    tensor_metadata[f"states_{key}"] = ((self.num_envs, self.capacity, *state_shapes[key]), state[key].dtype)
+                tensor_metadata["actions"] = ((self.num_envs, self.capacity, *action_shape), action.dtype)
+                tensor_metadata["rewards"] = ((self.num_envs, self.capacity), reward.dtype)
+                if not self.optimize_memory:
+                    for key in state_shapes:
+                        tensor_metadata[f"next_states_{key}"] = ((self.num_envs, self.capacity, *state_shapes[key]), state[key].dtype)
+                tensor_metadata["dones"] = ((self.num_envs, self.capacity), torch.bool)
+                tensor_metadata["truncateds"] = ((self.num_envs, self.capacity), torch.bool)
+                if self.has_complementary_info:
+                    for key, value in complementary_info.items():
+                        if isinstance(value, torch.Tensor):
+                            value_shape = value.squeeze(0).shape
+                            tensor_metadata[f"complementary_info_{key}"] = ((self.num_envs, self.capacity, *value_shape), value.dtype)
+                        elif isinstance(value, (int, float)):
+                            tensor_metadata[f"complementary_info_{key}"] = ((self.num_envs, self.capacity), value.dtype)
+                        else:
+                            raise ValueError(f"Unsupported type {type(value)} for complementary_info[{key}]")
+                dist.barrier()
+                tensor_metadata = self.shared_memory_manager.broadcast_tensor_metadata(tensor_metadata, rank)
+            
+            else:
+                dist.barrier()
+                tensor_metadata = self.shared_memory_manager.broadcast_tensor_metadata({}, rank)
+                state_shapes = {}
+                for tensor_name, (shape, dtype) in tensor_metadata.items():
+                    if tensor_name.startswith("states_"):
+                        key = tensor_name[len("states_") :]
+                        state_shapes[key] = shape[2:]  # Remove env and capacity dimensions
+                
+                self.has_complementary_info = any(name.startswith("complementary_info_") for name in tensor_metadata.keys())
+                self.complementary_info_keys = []
+                self.complementary_info = {}
+                if self.has_complementary_info:
+                    self.complementary_info_keys = [
+                        name[len("complementary_info_") :]
+                        for name in tensor_metadata.keys()
+                        if name.startswith("complementary_info_")
+                    ]
+                
+                self.states = {}
+                for key in state_shapes:
+                    tensor_name = f"states_{key}"
+                    if tensor_name in tensor_metadata:
+                        shape, dtype = tensor_metadata[tensor_name]
+                        self.states[key] = self.shared_memory_manager.create_shared_tensor(
+                            tensor_name, shape, dtype, rank
+                        )
+                
+                if "actions" in tensor_metadata:
+                    shape, dtype = tensor_metadata["actions"]
+                    self.actions = self.shared_memory_manager.create_shared_tensor(
+                        "actions", shape, dtype, rank
+                    )
+                
+                if "rewards" in tensor_metadata:
+                    shape, dtype = tensor_metadata["rewards"]
+                    self.rewards = self.shared_memory_manager.create_shared_tensor(
+                        "rewards", shape, dtype, rank
+                    )
+                
+                if not self.optimize_memory:
+                    self.next_states = {}
+                    for key in state_shapes:
+                        tensor_name = f"next_states_{key}"
+                        if tensor_name in tensor_metadata:
+                            shape, dtype = tensor_metadata[tensor_name]
+                            self.next_states[key] = self.shared_memory_manager.create_shared_tensor(
+                                tensor_name, shape, dtype, rank
+                            )
+                    else:
+                        self.next_states = self.states
+                
+                if "dones" in tensor_metadata:
+                    shape, dtype = tensor_metadata["dones"]
+                    self.dones = self.shared_memory_manager.create_shared_tensor(
+                        "dones", shape, dtype, rank
+                    )
+                
+                if "truncateds" in tensor_metadata:
+                    shape, dtype = tensor_metadata["truncateds"]
+                    self.truncateds = self.shared_memory_manager.create_shared_tensor(
+                        "truncateds", shape, dtype, rank
+                    )
+                
+                if self.has_complementary_info:
+                    for key in self.complementary_info_keys:
+                        tensor_name = f"complementary_info_{key}"
+                        if tensor_name in tensor_metadata:
+                            shape, dtype = tensor_metadata[tensor_name]
+                            self.complementary_info[key] = self.shared_memory_manager.create_shared_tensor(
+                                tensor_name, shape, dtype, rank
+                            )
+            
+        else:       
+            # Determine shapes from the first transition
+            # For parallel buffer, we need to get the shape per environment (remove batch dimension)
+            state_shapes = {key: val[0].shape for key, val in state.items()}
+            action_shape = action[0].shape
+
+            # Pre-allocate tensors for storage with parallel dimension: (num_envs, capacity, ...)
+            self.states = {
+                key: torch.empty((self.num_envs, self.capacity, *value[0].shape), device=self.storage_device, dtype=value.dtype)
+                for key, value in state.items()
+            }
+            self.actions = torch.empty((self.num_envs, self.capacity, *action_shape), device=self.storage_device)
+            self.rewards = torch.empty((self.num_envs, self.capacity), device=self.storage_device)
+
+            if not self.optimize_memory:
+                # Standard approach: store states and next_states separately
+                self.next_states = {
+                key: torch.empty((self.num_envs, self.capacity, *value[0].shape), device=self.storage_device, dtype=value.dtype)
+                for key, value in state.items()
+                }
+            else:
+                # Memory-optimized approach: don't allocate next_states buffer
+                # Just create a reference to states for consistent API
+                self.next_states = self.states  # Just a reference for API consistency
+
+            self.dones = torch.empty((self.num_envs, self.capacity), dtype=torch.bool, device=self.storage_device)
+            self.truncateds = torch.empty((self.num_envs, self.capacity), dtype=torch.bool, device=self.storage_device)
+
+            # Initialize storage for complementary_info
+            self.has_complementary_info = complementary_info is not None
+            self.complementary_info_keys = []
+            self.complementary_info = {}
+
+            if self.has_complementary_info:
+                self.complementary_info_keys = list(complementary_info.keys())
+                # Pre-allocate tensors for each key in complementary_info
+                for key, value in complementary_info.items():
+                    if isinstance(value, torch.Tensor):
+                        value_shape = value[0].shape
+                        self.complementary_info[key] = torch.empty(
+                            (self.num_envs, self.capacity, *value_shape), device=self.storage_device, dtype=value.dtype
+                        )
+                    elif isinstance(value, (int, float)):
+                        # Handle scalar values similar to reward
+                        self.complementary_info[key] = torch.empty((self.num_envs, self.capacity), device=self.storage_device)
+                    else:
+                        raise ValueError(f"Unsupported type {type(value)} for complementary_info[{key}]")
 
         self.initialized = True
 
@@ -232,6 +523,7 @@ class ParallelReplayBuffer:
     ):
         """
         Saves transitions for all parallel environments.
+        In distributed mode, only the rank 0 process will add transitions.
         
         Args:
             state: dict of tensors with shape (num_envs, ...)
@@ -242,6 +534,14 @@ class ParallelReplayBuffer:
             truncated: tensor with shape (num_envs,)
             complementary_info: dict of tensors with shape (num_envs, ...) or None
         """
+        rank, world_size = _get_distributed_info()
+
+        if world_size > 1 and rank != 0:
+            if not self.initialized:
+                raise RuntimeError(
+                    "Other ranks must wait for the main rank to initialize the buffer before adding transitions."
+                )
+            return
 
         # Initialize storage if this is the first transition
         if not self.initialized:
@@ -289,6 +589,8 @@ class ParallelReplayBuffer:
         within the valid filled region of the buffer, preventing NaN values from
         uninitialized memory.
         """
+        rank, world_size = _get_distributed_info()
+
         if not self.initialized:
             raise RuntimeError("Cannot sample from an empty buffer.")
         
@@ -307,27 +609,33 @@ class ParallelReplayBuffer:
         if n > self.capacity:
             raise ValueError("n_steps cannot be larger than buffer capacity")
         
-        # ---------- Only sample starting points with at least n valid steps ----------
-        # valid_starts[e] = # of legal start indices in env e: i in [0, sizes[e]-n]
-        # This ensures that for any sampled idx_in_env, we have idx_in_env + (n-1) <= sizes[e] - 1
-        valid_starts = torch.clamp(sizes - (n - 1), min=0)  # [E]
-        total_valid = int(valid_starts.sum().item())
-        
-        if total_valid == 0:
-            raise RuntimeError(
-                f"Not enough data to sample {n}-step transitions: "
-                f"need at least {n} steps in some environment."
-            )
-        
-        batch_size = min(batch_size, total_valid)
-        
-        # Global -> (env, idx_in_env_start) over valid starting positions
-        cum = torch.zeros(self.num_envs + 1, device=self.storage_device, dtype=torch.long)
-        cum[1:] = torch.cumsum(valid_starts, dim=0)  # [E+1]
-        
-        gidx = torch.randint(0, total_valid, (batch_size,), device=self.storage_device)
-        env = torch.bucketize(gidx, cum[1:], right=True)               # [B] in [0,E-1]
-        idx_in_env = gidx - cum[env]                                   # [B] in [0, valid_starts[env]-1]
+        if rank == 0:
+            # ---------- Only sample starting points with at least n valid steps ----------
+            # valid_starts[e] = # of legal start indices in env e: i in [0, sizes[e]-n]
+            # This ensures that for any sampled idx_in_env, we have idx_in_env + (n-1) <= sizes[e] - 1
+            valid_starts = torch.clamp(sizes - (n - 1), min=0)  # [E]
+            total_valid = int(valid_starts.sum().item())
+            
+            if total_valid == 0:
+                raise RuntimeError(
+                    f"Not enough data to sample {n}-step transitions: "
+                    f"need at least {n} steps in some environment."
+                )
+            
+            batch_size = min(batch_size * world_size, total_valid)
+            
+            # Global -> (env, idx_in_env_start) over valid starting positions
+            cum = torch.zeros(self.num_envs + 1, device=self.storage_device, dtype=torch.long)
+            cum[1:] = torch.cumsum(valid_starts, dim=0)  # [E+1]
+            
+            gidx = torch.randint(0, total_valid, (batch_size,), device=self.storage_device)
+        else:
+            gidx = torch.zeros(batch_size, device=self.storage_device)
+        if world_size > 1:
+            dist.broadcast(gidx, src=0)
+        gidx_curr_rank = gidx[rank::world_size]
+        env = torch.bucketize(gidx_curr_rank, cum[1:], right=True)               # [B] in [0,E-1]
+        idx_in_env = gidx_curr_rank - cum[env]                                   # [B] in [0, valid_starts[env]-1]
         
         # This idx_in_env is counted from the oldest transition of that env.
         # Map to absolute ring-buffer index.
@@ -489,6 +797,9 @@ class ParallelReplayBuffer:
             while not shutdown_event.is_set():
                 try:
                     batch = self.sample(batch_size)
+                    if self.preprocessor:
+                        batch['state'] = self.preprocessor(batch['state'])
+                        batch['next_state'] = self.preprocessor(batch['next_state'])
                     # The timeout ensures the thread unblocks if the queue is full
                     # and the shutdown event gets set meanwhile.
                     data_queue.put(batch, block=True, timeout=0.5)
@@ -536,6 +847,9 @@ class ParallelReplayBuffer:
         def enqueue(n):
             for _ in range(n):
                 data = self.sample(batch_size)
+                if self.preprocessor:
+                    data['state'] = self.preprocessor(data['state'])
+                    data['next_state'] = self.preprocessor(data['next_state'])
                 queue.append(data)
 
         enqueue(queue_size)
@@ -555,6 +869,8 @@ class ParallelReplayBuffer:
         use_drq: bool = True,
         storage_device: str = "cpu",
         optimize_memory: bool = False,
+        preprocessor: Callable | None = None,
+        buffer_name: str = "replay_buffer",
     ) -> "ParallelReplayBuffer":
         """
         Convert a LeRobotDataset into a ParallelReplayBuffer.
@@ -571,6 +887,7 @@ class ParallelReplayBuffer:
             use_drq (bool): Whether to use DrQ image augmentation when sampling.
             storage_device (str): Device for storing tensor data. Using "cpu" saves GPU memory.
             optimize_memory (bool): If True, reduces memory usage by not duplicating state data.
+            preprocessor (Callable | None): Function for preprocessing transitions.
 
         Returns:
             ParallelReplayBuffer: The replay buffer with dataset transitions.
@@ -585,6 +902,11 @@ class ParallelReplayBuffer:
                 "The capacity of the ParallelReplayBuffer must be greater than or equal to the length of the LeRobotDataset divided by num_envs."
             )
 
+        # Initialize with barrier if in distributed mode
+        rank, world_size = _get_distributed_info()
+        if world_size > 1  and rank != 0:
+            dist.barrier()
+
         # Create replay buffer with image augmentation and DrQ settings
         replay_buffer = cls(
             capacity=capacity,
@@ -595,64 +917,74 @@ class ParallelReplayBuffer:
             use_drq=use_drq,
             storage_device=storage_device,
             optimize_memory=optimize_memory,
+            preprocessor=preprocessor,
+            buffer_name=buffer_name,
         )
 
-        # Convert dataset to transitions
-        list_transition = cls._lerobotdataset_to_transitions(dataset=lerobot_dataset, state_keys=state_keys)
-
-        # Group transitions by episodes
-        episodes = []
-        current_episode = []
-        for transition in list_transition:
-            current_episode.append(transition)
-            if transition["done"]:
-                episodes.append(current_episode)
-                current_episode = []
+        # Sync buffer initialization
+        if world_size > 1 and rank == 0:
+            dist.barrier()
         
-        # Add the last episode if it's not empty
-        if current_episode:
-            episodes.append(current_episode)
+        if rank == 0:
+            # Convert dataset to transitions
+            list_transition = cls._lerobotdataset_to_transitions(dataset=lerobot_dataset, state_keys=state_keys)
 
-        # Distribute episodes across environments
-        env_episodes = [[] for _ in range(num_envs)]
-        for i, episode in enumerate(episodes):
-            env_idx = i % num_envs
-            env_episodes[env_idx].extend(episode)
+            # Group transitions by episodes
+            episodes = []
+            current_episode = []
+            for transition in list_transition:
+                current_episode.append(transition)
+                if transition["done"]:
+                    episodes.append(current_episode)
+                    current_episode = []
+            
+            # Add the last episode if it's not empty
+            if current_episode:
+                episodes.append(current_episode)
 
-        # Initialize the buffer with the first transition to set up storage tensors
-        if list_transition:
-            first_transition = list_transition[0]
-            first_state = {k: v.to(device) for k, v in first_transition["state"].items()}
-            first_action = first_transition[ACTION].to(device)
+            # Distribute episodes across environments
+            env_episodes = [[] for _ in range(num_envs)]
+            for i, episode in enumerate(episodes):
+                env_idx = i % num_envs
+                env_episodes[env_idx].extend(episode)
 
-            # Get complementary info if available
-            first_complementary_info = None
-            if (
-                "complementary_info" in first_transition
-                and first_transition["complementary_info"] is not None
-            ):
-                first_complementary_info = {
-                    k: v.to(device) for k, v in first_transition["complementary_info"].items()
-                }
+            # Initialize the buffer with the first transition to set up storage tensors
+            if list_transition:
+                first_transition = list_transition[0]
+                first_state = {k: v.to(device) for k, v in first_transition["state"].items()}
+                first_action = first_transition[ACTION].to(device)
 
-            replay_buffer._initialize_storage(
-                state=first_state, action=first_action, complementary_info=first_complementary_info
-            )
+                # Get complementary info if available
+                first_complementary_info = None
+                if (
+                    "complementary_info" in first_transition
+                    and first_transition["complementary_info"] is not None
+                ):
+                    first_complementary_info = {
+                        k: v.to(device) for k, v in first_transition["complementary_info"].items()
+                    }
 
-        # Fill the buffer with transitions distributed across environments
-        for env_idx in range(num_envs):
-            for transition in env_episodes[env_idx]:
-                # Add to specific environment
-                replay_buffer._add_to_env(
-                    env_idx=env_idx,
-                    state=transition["state"],
-                    action=transition["action"],
-                    reward=transition["reward"],
-                    next_state=transition["next_state"],
-                    done=transition["done"],
-                    truncated=transition["truncated"],
-                    complementary_info=transition["complementary_info"],
+                replay_buffer._initialize_storage(
+                    state=first_state, action=first_action, complementary_info=first_complementary_info
                 )
+
+            # Fill the buffer with transitions distributed across environments
+            for env_idx in range(num_envs):
+                for transition in env_episodes[env_idx]:
+                    # Add to specific environment
+                    replay_buffer._add_to_env(
+                        env_idx=env_idx,
+                        state=transition["state"],
+                        action=transition["action"],
+                        reward=transition["reward"],
+                        next_state=transition["next_state"],
+                        done=transition["done"],
+                        truncated=transition["truncated"],
+                        complementary_info=transition["complementary_info"],
+                    )
+        else:
+            # Non rank 0 processes only initializes storage
+            replay_buffer._initialize_storage()
 
         return replay_buffer
 

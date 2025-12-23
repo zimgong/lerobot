@@ -128,6 +128,7 @@ class RepackLwlabObservationProcessorStep(ObservationProcessorStep):
         """
         # Extract policy observations
         policy_obs = observation.get("policy", {})
+        general_obs = observation.get("embodiment_general_obs", {})
         processed_obs = {}
         
         # Process camera images
@@ -150,6 +151,9 @@ class RepackLwlabObservationProcessorStep(ObservationProcessorStep):
                     # fill nan with 0
                     policy_obs[key] = torch.where(torch.isnan(policy_obs[key]), torch.randn_like(policy_obs[key]), policy_obs[key])
                     env_state_parts.append(policy_obs[key])
+                if key in general_obs:
+                    general_obs[key] = torch.where(torch.isnan(general_obs[key]), torch.randn_like(general_obs[key]), general_obs[key])
+                    env_state_parts.append(general_obs[key])
             if env_state_parts:
                 env_state = torch.concat(env_state_parts, dim=1)
                 processed_obs[OBS_ENV_STATE] = env_state
@@ -162,6 +166,9 @@ class RepackLwlabObservationProcessorStep(ObservationProcessorStep):
                     # fill nan with 0
                     policy_obs[key] = torch.where(torch.isnan(policy_obs[key]), torch.randn_like(policy_obs[key]), policy_obs[key])
                     obs_state_parts.append(policy_obs[key])
+                if key in general_obs:
+                    general_obs[key] = torch.where(torch.isnan(general_obs[key]), torch.randn_like(general_obs[key]), general_obs[key])
+                    obs_state_parts.append(general_obs[key])
             if obs_state_parts:
                 obs_state = torch.concat(obs_state_parts, dim=1)
                 processed_obs[OBS_STATE] = obs_state

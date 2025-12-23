@@ -227,6 +227,3 @@ def merge_offline_online_success(
         logging.info(f"Created merged buffer with {len(merged_buffer)} transitions")
         
         return merged_buffer
-
-    
-    

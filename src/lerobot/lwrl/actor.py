@@ -48,6 +48,7 @@ https://github.com/michel-aractingi/lerobot-hilserl-guide
 
 import logging
 import os
+import sys
 import time
 from functools import lru_cache
 from queue import Empty
@@ -252,6 +253,15 @@ def act_with_policy(
         online_env, teleop_device = make_lwlab_robot_env(cfg=cfg.env)
         env_processor, action_processor = make_lwlab_processors(online_env, teleop_device, cfg.env, cfg.policy.device)
     else:
+        display = None
+        if not has_display():
+            logging.info("No display found, creating virtual display")
+            import pyvirtualdisplay
+
+            display = pyvirtualdisplay.Display(visible=0, size=(1920, 1080))
+            display.start()
+        else:
+            logging.info("Display found, using existing display")
         online_env, teleop_device = make_robot_env(cfg=cfg.env)
         env_processor, action_processor = make_processors(online_env, teleop_device, cfg.env, cfg.policy.device)
 
@@ -272,6 +282,7 @@ def act_with_policy(
     )
     policy = policy.eval()
     assert isinstance(policy, nn.Module)
+    observation_preprocessor = getattr(policy, "observation_preprocessor", None)
 
     obs, info = online_env.reset()
     env_processor.reset()
@@ -307,9 +318,14 @@ def act_with_policy(
             logging.info("[ACTOR] Shutting down act_with_policy")
             return
 
-        observation = {
-            k: v for k, v in transition[TransitionKey.OBSERVATION].items() if k in cfg.policy.input_features
-        }
+        observation = {}
+        for k, v in transition[TransitionKey.OBSERVATION].items():
+            if k in cfg.env.features_map:
+                observation[cfg.env.features_map[k]] = v
+            elif k in cfg.policy.input_features:
+                observation[k] = v
+        if observation_preprocessor:
+            observation = observation_preprocessor(observation)
 
         if interaction_step >= cfg.policy.online_step_before_learning:
             # Time policy inference and check if it meets FPS requirement
@@ -319,6 +335,13 @@ def act_with_policy(
                 if action.isnan().any():
                     raise ValueError("Action is NaN")
             policy_fps = policy_timer.fps_last
+            if observation_preprocessor:
+                observation.pop("pixel_values")
+                observation.pop("input_ids")
+                observation.pop("attention_mask")
+                observation.pop("position_ids")
+                observation.pop("image_flags")
+                observation.pop("labels")
 
             log_policy_frequency_issue(policy_fps=policy_fps, cfg=cfg, interaction_step=interaction_step)
         else:
@@ -809,6 +832,72 @@ def log_policy_frequency_issue(policy_fps: float, cfg: TrainRLServerPipelineConf
 
 def use_threads(cfg: TrainRLServerPipelineConfig) -> bool:
     return cfg.policy.concurrency.actor == "threads"
+
+
+def has_display() -> bool:
+    """
+    Detects if there is a monitor/display available on the machine.
+    Checks both the DISPLAY environment variable and attempts to verify
+    that the X server is actually accessible.
+    Returns:
+        True if a display is available, False otherwise.
+    """
+    # Check if DISPLAY environment variable is set
+    display = os.environ.get("DISPLAY")
+    if not display:
+        logging.info("No DISPLAY environment variable set")
+        return False
+
+    # On Linux, verify we can actually connect to the X server
+    if sys.platform == "linux":
+        try:
+            import subprocess
+            # Use xdpyinfo to verify X server is accessible
+            # This is a standard utility available on most Linux systems
+            result = subprocess.run(
+                ["xdpyinfo", "-display", display],
+                capture_output=True,
+                timeout=1,
+            )
+            if result.returncode == 0:
+                logging.info(
+                    f"Display {display} is available and accessible"
+                )
+                return True
+            else:
+                logging.info(
+                    f"Display {display} is set but not accessible"
+                )
+                return False
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            # xdpyinfo not available or timed out,
+            # try alternative check with Xlib
+            try:
+                from Xlib import display as xdisplay
+                d = xdisplay.Display(display)
+                d.close()
+                logging.info(
+                    f"Display {display} is available and accessible"
+                )
+                return True
+            except (ImportError, Exception) as e:
+                logging.info(
+                    f"Display {display} is set but accessibility "
+                    f"cannot be verified: {e}"
+                )
+                # If we can't verify, assume display exists if DISPLAY is set
+                return True
+        except Exception as e:
+            logging.info(
+                f"Error checking display availability: {e}, "
+                f"assuming display exists"
+            )
+            # If we can't verify, assume display exists if DISPLAY is set
+            return True
+
+    # For non-Linux platforms, just check if DISPLAY is set
+    logging.info(f"Display {display} is set (non-Linux platform)")
+    return True
 
 
 if __name__ == "__main__":
