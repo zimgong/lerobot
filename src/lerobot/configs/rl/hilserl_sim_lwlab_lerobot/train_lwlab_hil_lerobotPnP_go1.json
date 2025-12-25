@@ -1,0 +1,203 @@
+{
+    "output_dir": null,
+    "job_name": "lwlab_lerobot_pickup_20env_go1_single",
+    "resume": false,
+    "seed": 1000,
+    "num_workers": 64,
+    "batch_size": 64,
+    "steps": 200000,
+    "eval_freq": 20000,
+    "log_freq": 1,
+    "save_checkpoint": true,
+    "save_freq": 5000,
+    "use_policy_training_preset": true,
+    "optimizer": null,
+    "scheduler": null,
+    "wandb": {
+        "enable": false,
+        "project": "franka_sim",
+        "disable_artifact": true
+    },
+    "dataset": {
+        "root": "/home/zimu.gong/.cache/huggingface/lerobot/zimgong/lerobot_lift_visual_pruned_280",
+        "repo_id": "lerobot_lift_visual_offline_data_pruned",
+        "use_imagenet_stats": false
+    },
+    "env": {
+        "type": "lwlab",
+        "name": "lwlab_sim",
+        "task": "env_server_lerobot_liftobj",
+        "num_envs": 20,
+        "fps": 10,
+        "robot": null,
+        "teleop": null,
+        "processor": {
+            "OBS_STATE_KEYS": ["joint_pos"],
+            "CAMERA_KEYS": ["global_camera_rgb"],
+            "control_mode": "keyboard_ee",
+            "gripper": {
+                "use_gripper": true,
+                "gripper_penalty": -0.02
+            },
+            "reset": {
+                "fixed_reset_joint_positions": null,
+                "reset_time_s": 2.0,
+                "control_time_s": 15.0,
+                "terminate_on_success": true
+            }
+        },
+        "features": {
+            "observation.images.global_camera_rgb": {
+                "type": "VISUAL",
+                "shape": [3, 128, 128]
+            },
+            "observation.state": {
+                "type": "STATE",
+                "shape": [6]
+            },
+            "action": {
+                "type": "ACTION",
+                "shape": [6]
+            }
+        },
+        "features_map": {
+            "observation.images.global_camera_rgb": "observation.images.image_global",
+            "observation.state": "observation.state",
+            "action": "action"
+        }
+    },
+    "policy": {
+        "type": "sac_go1",
+        "n_obs_steps": 1,
+        "normalization_mapping": {
+            "VISUAL": "MEAN_STD",
+            "STATE": "MIN_MAX",
+            "ENV": "MIN_MAX",
+            "ACTION": "MIN_MAX"
+        },
+        "input_features": {
+            "observation.images.image_global": {
+                "type": "VISUAL",
+                "shape": [3, 128, 128]
+            },
+            "observation.state": {
+                "type": "STATE",
+                "shape": [6]
+            }
+        },
+        "output_features": {
+            "action": {
+                "type": "ACTION",
+                "shape": [6]
+            }
+        },
+        "space_repack": {
+            "state": "observation.state",
+            "action": "action",
+            "cam_head_color": "observation.images.image_global"
+        },
+        "ctrl_freq": 10,
+        "default_prompt": "pick and lift the cube",
+        "device": "cuda",
+        "use_amp": false,
+        "vision_encoder_name": "vla",
+        "freeze_vision_encoder": true,
+        "dataset_stats": {
+            "observation.images.image_global": {
+                "mean": [0.485, 0.456, 0.406],
+                "std": [0.229, 0.224, 0.225]
+            },
+            "observation.state": {
+                "min": [
+                    -0.33423101902008057,
+                    0.0,
+                    -0.3839914798736572,
+                    0.767565131187439,
+                    1.0467044115066528,
+                    0.05212025344371796
+                ],
+                "max": [
+                    0.43570759892463684,
+                    0.6520180106163025,
+                    0.29653236269950867,
+                    1.605927586555481,
+                    1.5956183671951294,
+                    1.074834942817688
+                ]
+            }
+        },
+        "repo_id": "hf_username/policy_name",
+        "storage_device": "cpu",
+        "shared_encoder": true,
+        "online_steps": 1000000,
+        "online_buffer_capacity": 100000,
+        "offline_buffer_capacity": 100000,
+        "async_prefetch": false,
+        "online_step_before_learning": 100,
+        "policy_update_freq": 1,
+        "critic_step_before_actor": 4000,
+        "discount": 0.97,
+        "temperature_init": 0.01,
+        "num_critics": 2,
+        "num_subsample_critics": null,
+        "critic_lr": 0.0003,
+        "actor_lr": 0.0003,
+        "temperature_lr": 0.0003,
+        "critic_target_update_weight": 0.005,
+        "utd_ratio": 2,
+        "state_encoder_hidden_dim": 256,
+        "latent_dim": 64,
+        "target_entropy": null,
+        "use_backup_entropy": true,
+        "grad_clip_norm": 10.0,
+        "num_discrete_actions": 3,
+        "go1_model_kwargs": {
+            "model_name_or_path": "/home/zimu.gong/AgiBot-World/experiment/GO1_Air_LeRobot_vit_small_sft_128/checkpoint-2500",
+            "freeze_llm": true,
+            "freeze_backbone": true,
+            "freeze_mlp": true,
+            "action_chunk_size": 1,
+            "latent_planning": false
+        },
+        "critic_network_kwargs": {
+            "hidden_dims": [256, 256],
+            "activate_final": true,
+            "final_activation": null
+        },
+        "actor_network_kwargs": {
+            "hidden_dims": [256, 256],
+            "activate_final": true
+        },
+        "policy_kwargs": {
+            "use_tanh_squash": true,
+            "std_min": 1e-5,
+            "std_max": 5,
+            "init_final": 0.05,
+            "action_low_bound": [
+                -5.259829044342041,
+                -3.946262836456299,
+                -4.712678909301758,
+                -10.8388032913208,
+                -6.196352958679199,
+                -3.483210563659668
+            ],
+            "action_high_bound": [
+                3.0570151805877686,
+                12.902525901794434,
+                10.454845428466797,
+                6.118478775024414,
+                5.915607452392578,
+                1.2877321243286133 
+            ]
+        },
+        "actor_learner_config": {
+            "learner_host": "127.0.0.1",
+            "learner_port": 50051,
+            "policy_parameters_push_frequency": 50
+        },
+        "concurrency": {
+            "actor": "threads",
+            "learner": "threads"
+        }
+    }
+}

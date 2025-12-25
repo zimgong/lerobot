@@ -920,7 +920,9 @@ class Policy(nn.Module):
         init_final: float | None = None,
         use_tanh_squash: bool = False,
         encoder_is_shared: bool = False,
-        ctrl_freq = None,
+        ctrl_freq: int = None,
+        action_low_bound: list[float] = None,
+        action_high_bound: list[float] = None,
     ):
         super().__init__()
         self.encoder: SACObservationEncoder = encoder
@@ -932,6 +934,9 @@ class Policy(nn.Module):
         self.use_tanh_squash = use_tanh_squash
         self.encoder_is_shared = encoder_is_shared
         self.ctrl_freq = ctrl_freq
+        self.action_low_bound = action_low_bound
+        self.action_high_bound = action_high_bound
+
         # Find the last Linear layer's output dimension
         out_features = self.network.config.action_config.hidden_size
         # Mean layer
@@ -1025,7 +1030,7 @@ class Policy(nn.Module):
             std = self.fixed_std.expand_as(means)
 
         # Build transformed distribution
-        dist = TanhMultivariateNormalDiag(loc=means, scale_diag=std)
+        dist = TanhMultivariateNormalDiag(loc=means, scale_diag=std, low=self.action_low_bound, high=self.action_high_bound)
 
         # Sample actions (reparameterized)
         actions = dist.rsample()
